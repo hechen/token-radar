@@ -1,4 +1,4 @@
-// Token Radar, radar-4 (Node 22, standard library only).
+// Token Radar, radar-5 (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
 // every pre-token protocol with the model in lib/model.ts, writes the ranked board to
@@ -86,8 +86,12 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 const totalImplied = board.reduce((n, r) => n + r.implied_value_usd, 0);
+const verdicts = { farm: 0, thin: 0, skip: 0 };
+for (const r of board) verdicts[r.net_verdict]++;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: top implied ${board[0]!.name} $${board[0]!.implied_value_usd.toLocaleString('en-US')}, total implied $${totalImplied.toLocaleString('en-US')}, size slope ${radar.size_curve.slope}, flat LOO ${radar.validation.median_abs_log_error} vs curve LOO ${radar.validation.size_curve.median_abs_log_error}\n` +
+    `token radar: top implied ${board[0]!.name} $${board[0]!.implied_value_usd.toLocaleString('en-US')}, total implied $${totalImplied.toLocaleString('en-US')}, size slope ${radar.size_curve.slope}, flat LOO ${radar.validation.median_abs_log_error} (x${Math.exp(radar.validation.median_abs_log_error).toFixed(2)}) vs curve LOO ${radar.validation.size_curve.median_abs_log_error} (x${Math.exp(radar.validation.size_curve.median_abs_log_error).toFixed(2)})\n` +
+    `token radar: walk-forward curve LOO ${radar.validation.walk_forward.curve_median_abs_log_error} (x${Math.exp(radar.validation.walk_forward.curve_median_abs_log_error).toFixed(2)}) vs flat ${radar.validation.walk_forward.flat_median_abs_log_error} (x${Math.exp(radar.validation.walk_forward.flat_median_abs_log_error).toFixed(2)}), n=${radar.validation.walk_forward.test_n} newer protocols\n` +
+    `token radar: range x${radar.validation.range.lo_multiplier}–x${radar.validation.range.hi_multiplier}, LOO coverage ${(radar.validation.range.loo_coverage * 100).toFixed(1)}% (bootstrap intervals ${(radar.validation.range.bootstrap_coverage * 100).toFixed(1)}%), verdicts farm ${verdicts.farm} / thin ${verdicts.thin} / skip ${verdicts.skip}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

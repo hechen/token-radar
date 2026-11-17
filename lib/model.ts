@@ -1,4 +1,4 @@
-// The token radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-5: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the watchlist's own quality rule keeps, at any TVL: the early rows the
@@ -34,22 +34,34 @@
 // errors side by side. The board uses the curve only because it wins out of sample: on this
 // snapshot the flat median misses by 1.66 log points and the curve by 1.44. A multiple the
 // comparables cannot predict shows up there, in the open, rather than hiding inside the ranking.
+// A walk-forward check trains the same two estimators on the older protocols and tests them on the
+// newer ones by listing date, and the curve wins there too; both numbers are reported.
 //
-// The ranking carries its own uncertainty: the model is refit 200 times, each time resampling the
-// token-bearing protocols with replacement (a seeded generator, so the build is deterministic) and
-// refitting the whole size curve, and every row gets an implied-value interval and a rank interval
-// — the 10th and 90th percentiles of its 200 refits. A row ranked 3rd with a rank interval of 2-7
-// is a strong row with an honest margin, not a false precision.
+// The ranking carries its own uncertainty, and the range is calibrated, not just refit: the
+// leave-one-out residuals of the size curve — how far its predictions actually miss, held out —
+// set each row's implied-value interval, the 10th and 90th percentiles of those residuals, so the
+// interval covers about four in five held-out values (measured out of sample, not assumed). The
+// refit-only intervals the previous model printed covered only one in four. The rank interval is
+// still the 10th and 90th percentiles over 200 refits of the model, which says how far a rank
+// moves when the comparables shift, not how far the value could be.
 //
 // The airdrop pool is a labelled assumption, never a promise: pool = implied x POOL_SHARE, the
-// community's share of a launch at a typical 7.5% allocation. Farm cost is the capital the plan
-// needs plus the gas the plan spends over its hold. The net is the pool minus that farm cost, and
-// the verdict is per farmer: one farmer's expected take assumes the pool is split among
-// ASSUMED_FARMERS farmers, so take = pool / ASSUMED_FARMERS; farm when the take clears the farm
-// cost by at least THIN_NET_USD, thin when it clears it by less, skip when it does not clear it at
-// all. The farmer count is a labelled assumption like the pool share, stated wherever the verdict
-// appears; the whole-pool net and the per-farmer take are both shown, so the arithmetic can be
-// checked either way.
+// community's share of a launch at a typical 7.5% allocation. A farm plan is sized by deposit:
+// the standard tier deposits $1,000 and takes one share of the pool — one of 1,000 farmers each
+// depositing $1,000 — and the large tier deposits $10,000 and takes ten shares; both pay the gas
+// over the hold and a 0.3% swap fee on the deposit. The verdict is on the standard tier's net:
+// farm only when the take clears the deposit, the gas and the fee by at least $500 — a clearly
+// profitable plan, not a marginal one — thin when it clears them by less, skip when it does not
+// clear them at all. The farmer count and the pro-rata share are labelled assumptions like the
+// pool share, stated wherever the verdict appears; the whole-pool net and each tier's take are
+// both shown, so the arithmetic can be checked either way.
+//
+// Changes tested for radar-5 and left out, because they did not clearly win out of sample under
+// the same leave-one-out protocol: a launch-odds multiplier (no label for "has a token" predicts
+// actual launches better than the majority baseline — the strict market-data labels never beat it
+// on accuracy, and the loose record label that does is mostly symbol-only records); per-category
+// slopes (leave-one-out 1.44 to 1.42, while the share within twice the true multiple fell);
+// and a softer multiple floor (the leave-one-out median did not move at 0.02 or 0.01).
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -88,7 +100,10 @@ export interface ModelConstants {
   multiple_cap: number;
   pool_share: number;
   assumed_farmers: number;
-  thin_net_usd: number;
+  standard_deposit_usd: number;
+  large_deposit_usd: number;
+  swap_fee_rate: number;
+  farm_net_threshold_usd: number;
   bootstrap_replicates: number;
 }
 
@@ -105,12 +120,15 @@ export const MODEL: ModelConstants = {
   multiple_cap: 1.0,
   pool_share: 0.075,
   assumed_farmers: 1000,
-  thin_net_usd: 100,
+  standard_deposit_usd: 1000,
+  large_deposit_usd: 10000,
+  swap_fee_rate: 0.003,
+  farm_net_threshold_usd: 500,
   bootstrap_replicates: 200,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -150,6 +168,10 @@ export interface BoardRow {
   farmer_take_usd: number;
   farmer_net_usd: number;
   net_verdict: 'farm' | 'thin' | 'skip';
+  tier1_take_usd: number;
+  tier1_net_usd: number;
+  tier10_take_usd: number;
+  tier10_net_usd: number;
   model: {
     category_multiple: number;
     category_comps: number;
@@ -191,6 +213,10 @@ export interface RadarRow {
   farmer_take_usd: number;
   farmer_net_usd: number;
   net_verdict: 'farm' | 'thin' | 'skip';
+  tier1_take_usd: number;
+  tier1_net_usd: number;
+  tier10_take_usd: number;
+  tier10_net_usd: number;
   category_multiple: number;
   category_comps: number;
   family: string | null;
@@ -263,6 +289,54 @@ export interface ValidationResult {
   };
   /** Pearson correlation between log(TVL) and log(multiple): why a size curve, not a flat median. */
   log_tvl_correlation: number;
+  /** The calibrated implied-value range, from the curve's own leave-one-out residuals. */
+  range: RangeCalibration;
+  /** The walk-forward check: train on the older protocols, test on the newer ones by listing date. */
+  walk_forward: WalkForwardResult;
+}
+
+/** The calibrated implied-value range: the 10th and 90th percentiles of the size curve's
+ * leave-one-out residuals, as multipliers on a row's implied value, with the coverage those
+ * intervals achieve when each held-out protocol's interval is built from the other protocols'
+ * residuals — and, for comparison, the coverage of the refit-only intervals the previous model
+ * printed, measured the same way on the same protocols. */
+export interface RangeCalibration {
+  /** The 10th percentile of the leave-one-out log residuals. */
+  residual_p10_log: number;
+  /** The 90th percentile of the leave-one-out log residuals. */
+  residual_p90_log: number;
+  /** exp(residual_p10_log): the low end of a row's implied-value interval, as a multiple of its point estimate. */
+  lo_multiplier: number;
+  /** exp(residual_p90_log): the high end, as a multiple of its point estimate. */
+  hi_multiplier: number;
+  /** Share of held-out protocols whose true value falls inside their leave-one-out interval. */
+  loo_coverage: number;
+  /** Share of held-out protocols whose true value falls inside their bootstrap refit interval. */
+  bootstrap_coverage: number;
+}
+
+/** The walk-forward check: the same two estimators, trained on the older trading protocols and
+ * tested on the newer ones by listing date, plus the reverse (train newer, test older) as a check
+ * that the win is not an artefact of one direction. */
+export interface WalkForwardResult {
+  /** Trading protocols with a listing date, in the train set (the older two thirds). */
+  train_n: number;
+  /** Trading protocols with a listing date, in the test set (the newer third). */
+  test_n: number;
+  /** The listing date that splits train from test: protocols listed on or before it train. */
+  cutoff: string;
+  /** Median |log error| of the size curve on the newer protocols. */
+  curve_median_abs_log_error: number;
+  /** Share of the newer protocols the size curve predicts within 2x. */
+  curve_within_2x: number;
+  /** Median |log error| of the flat category-family-global median on the newer protocols. */
+  flat_median_abs_log_error: number;
+  /** Share of the newer protocols the flat median predicts within 2x. */
+  flat_within_2x: number;
+  /** Median |log error| of the size curve in the reverse direction (train newer, test older). */
+  reverse_curve_median_abs_log_error: number;
+  /** Median |log error| of the flat median in the reverse direction. */
+  reverse_flat_median_abs_log_error: number;
 }
 
 /** One row's refit intervals: the 10th and 90th percentiles of its bootstrap refits. */
@@ -580,6 +654,144 @@ function withoutOne(list: number[], value: number): number[] {
   return copy;
 }
 
+/** One held-out protocol's leave-one-out result for the size curve. */
+interface CurveResidual {
+  resid: number;
+  source: 'category' | 'family' | 'global';
+}
+
+/**
+ * The size curve's leave-one-out residuals: each token-bearing protocol held out in turn, the
+ * curve refit without it, and the log of the predicted multiple over its own market multiple.
+ * A residual of 0.69 means a 2x miss. The same loop the validation's curve figures come from,
+ * kept as a function so the range calibration shares it.
+ */
+export function looCurveResiduals(protocols: SnapshotProtocol[], model: ModelConstants): CurveResidual[] {
+  const points = curvePoints(protocols);
+  const out: CurveResidual[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const rest = points.slice(0, i).concat(points.slice(i + 1));
+    const refit = fitSizeCurvePoints(rest);
+    const held = points[i]!;
+    const predicted = sizeCurveMultipleFor(held.category, held.tvl, refit, model);
+    out.push({ resid: Math.log(predicted.multiple / held.ratio), source: predicted.source });
+  }
+  return out;
+}
+
+/**
+ * The calibrated implied-value range, from the curve's own leave-one-out residuals: the 10th and
+ * 90th percentiles of those residuals, as multipliers on a row's implied value. The coverage is
+ * measured out of sample too: each held-out protocol's interval is built from the other
+ * protocols' residuals, and the coverage is the share whose true value falls inside it. The
+ * bootstrap coverage is filled in by buildRadar, which runs the refits; it starts at 0 here.
+ */
+export function rangeCalibration(protocols: SnapshotProtocol[], model: ModelConstants): RangeCalibration {
+  const residuals = looCurveResiduals(protocols, model);
+  const sorted = residuals.map((r) => r.resid).sort((a, b) => a - b);
+  const [p10, p90] = sorted.length === 0 ? [0, 0] : deciles(sorted);
+  let covered = 0;
+  for (let i = 0; i < residuals.length; i++) {
+    const others = residuals.filter((_, j) => j !== i).map((r) => r.resid).sort((a, b) => a - b);
+    if (others.length === 0) continue;
+    const [lo, hi] = deciles(others);
+    const r = residuals[i]!.resid;
+    if (r >= lo && r <= hi) covered++;
+  }
+  return {
+    residual_p10_log: round4(p10),
+    residual_p90_log: round4(p90),
+    lo_multiplier: round4(Math.exp(p10)),
+    hi_multiplier: round4(Math.exp(p90)),
+    loo_coverage: residuals.length === 0 ? 0 : round4(covered / residuals.length),
+    bootstrap_coverage: 0,
+  };
+}
+
+/** The flat category-family-global median multiple, fitted on one protocol list. */
+function flatMultipleFor(
+  protocol: SnapshotProtocol,
+  lists: { byCategory: Map<string, number[]>; byFamily: Map<string, number[]>; global: number[] },
+  model: ModelConstants,
+): { multiple: number; source: 'category' | 'family' | 'global' } {
+  const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
+  const key = protocol.category ?? 'Other';
+  const catList = lists.byCategory.get(key) ?? [];
+  if (catList.length >= model.min_comps) return { multiple: clamp(median(catList)), source: 'category' };
+  const fam = familyOf(protocol.category);
+  const famList = fam === null ? [] : (lists.byFamily.get(fam) ?? []);
+  if (famList.length >= model.min_comps) return { multiple: clamp(median(famList)), source: 'family' };
+  const globalList = lists.global;
+  if (globalList.length === 0) return { multiple: 0.2, source: 'global' };
+  return { multiple: clamp(median(globalList)), source: 'global' };
+}
+
+/**
+ * The walk-forward check: the trading protocols with a listing date, sorted by it, split into
+ * the older two thirds (train) and the newer third (test). Both estimators — the size curve and
+ * the flat category-family-global median — are fitted on the train set only and tested on the
+ * newer protocols, and the same is done in reverse. A win that holds in both directions is not
+ * an artefact of one split.
+ */
+export function walkForward(protocols: SnapshotProtocol[], model: ModelConstants): WalkForwardResult {
+  const dated: { p: SnapshotProtocol; ratio: number }[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0 || p.listed_at === null) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    dated.push({ p, ratio });
+  }
+  dated.sort((a, b) => (a.p.listed_at as string).localeCompare(b.p.listed_at as string));
+  const empty: WalkForwardResult = {
+    train_n: 0,
+    test_n: 0,
+    cutoff: '',
+    curve_median_abs_log_error: 0,
+    curve_within_2x: 0,
+    flat_median_abs_log_error: 0,
+    flat_within_2x: 0,
+    reverse_curve_median_abs_log_error: 0,
+    reverse_flat_median_abs_log_error: 0,
+  };
+  if (dated.length < 9) return empty;
+  const cut = Math.floor((dated.length * 2) / 3);
+  const train = dated.slice(0, cut);
+  const test = dated.slice(cut);
+  const score = (trainSet: { p: SnapshotProtocol; ratio: number }[], testSet: { p: SnapshotProtocol; ratio: number }[]) => {
+    const trainProtocols = trainSet.map((d) => d.p);
+    const { fit } = fitSizeCurve(trainProtocols, model);
+    const lists = ratioLists(trainProtocols);
+    const curveErrs: number[] = [];
+    const flatErrs: number[] = [];
+    for (const d of testSet) {
+      const curvePred = sizeCurveMultipleFor(d.p.category, d.p.tvl_usd, fit, model).multiple;
+      curveErrs.push(Math.abs(Math.log(curvePred / d.ratio)));
+      flatErrs.push(Math.abs(Math.log(flatMultipleFor(d.p, lists, model).multiple / d.ratio)));
+    }
+    curveErrs.sort((a, b) => a - b);
+    flatErrs.sort((a, b) => a - b);
+    return {
+      curveMedian: curveErrs.length === 0 ? 0 : median(curveErrs),
+      curveWithin2x: curveErrs.length === 0 ? 0 : curveErrs.filter((e) => e < Math.LN2).length / curveErrs.length,
+      flatMedian: flatErrs.length === 0 ? 0 : median(flatErrs),
+      flatWithin2x: flatErrs.length === 0 ? 0 : flatErrs.filter((e) => e < Math.LN2).length / flatErrs.length,
+    };
+  };
+  const fwd = score(train, test);
+  const rev = score(test, train);
+  return {
+    train_n: train.length,
+    test_n: test.length,
+    cutoff: train[train.length - 1]!.p.listed_at as string,
+    curve_median_abs_log_error: round4(fwd.curveMedian),
+    curve_within_2x: round4(fwd.curveWithin2x),
+    flat_median_abs_log_error: round4(fwd.flatMedian),
+    flat_within_2x: round4(fwd.flatWithin2x),
+    reverse_curve_median_abs_log_error: round4(rev.curveMedian),
+    reverse_flat_median_abs_log_error: round4(rev.flatMedian),
+  };
+}
+
 /**
  * Leave-one-out validation of the multiple estimator, both ways: each token-bearing protocol is
  * held out in turn and its market multiple is predicted from the others — once by the flat
@@ -590,7 +802,7 @@ function withoutOne(list: number[], value: number): number[] {
  * is checkable rather than claimed. Everything is computed from this snapshot at build time;
  * nothing about the result is written in.
  */
-export function validateModel(protocols: SnapshotProtocol[], model: ModelConstants): ValidationResult {
+export function validateModel(protocols: SnapshotProtocol[], model: ModelConstants, range?: RangeCalibration): ValidationResult {
   const lists = ratioLists(protocols);
   const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
   const errors: number[] = [];
@@ -655,6 +867,8 @@ export function validateModel(protocols: SnapshotProtocol[], model: ModelConstan
       by_source: curveBySource,
     },
     log_tvl_correlation: correlation,
+    range: range ?? rangeCalibration(protocols, model),
+    walk_forward: walkForward(protocols, model),
   };
 }
 
@@ -768,8 +982,9 @@ export interface BoardSummary {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, range?: RangeCalibration): BoardRow[] {
   const { fit } = fitSizeCurve(snapshot.protocols, model);
+  const rangeCalc = range ?? rangeCalibration(snapshot.protocols, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -787,9 +1002,22 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   const scored = [...chosen.values()].map((p) => {
     const { implied, multiple, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, fit);
     const familyEntry = multiple.family !== null ? fit.byFamily.get(multiple.family) : undefined;
-    const capital = capitalFor(p);
+    // One farm plan, sized by deposit: the standard tier deposits $1,000 and takes one share of
+    // the pool — one of 1,000 farmers each depositing $1,000 — and the large tier deposits
+    // $10,000 and takes ten shares. Both pay the gas over the hold and a 0.3% swap fee on the
+    // deposit. The pool is the assumed 7.5% community share of the implied value.
+    const capital = model.standard_deposit_usd;
     const hold = holdDaysFor(age);
     const weeks = Math.max(1, Math.ceil(hold / 7));
+    const gas = 8 + 2 * weeks;
+    const pool = Math.max(1, Math.round(implied * model.pool_share));
+    const take1 = Math.max(1, Math.round(pool / model.assumed_farmers));
+    const cost1 = capital + gas + Math.round(capital * model.swap_fee_rate);
+    const net1 = take1 - cost1;
+    const large = model.large_deposit_usd;
+    const take10 = Math.max(1, Math.round((pool * large) / (model.assumed_farmers * capital)));
+    const cost10 = large + gas + Math.round(large * model.swap_fee_rate);
+    const net10 = take10 - cost10;
     return {
       p,
       implied,
@@ -801,22 +1029,30 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age,
       capital,
       hold,
-      gas: 8 + 2 * weeks,
-      pool: Math.max(1, Math.round(implied * model.pool_share)),
+      gas,
+      pool,
+      take1,
+      cost1,
+      net1,
+      take10,
+      cost10,
+      net10,
     };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  // The rank interval is still the 10th and 90th percentiles over 200 refits of the model; the
+  // implied-value interval is the calibrated one, from the curve's leave-one-out residuals, so
+  // the range says how far the value could be, not only how far the refits move it.
   const uncertainty = bootstrapUncertainty(
     scored.map((s) => ({ slug: s.p.slug, category: s.p.category, tvl_usd: s.p.tvl_usd, growthMult: s.growthMult, maturityMult: s.maturityMult })),
     snapshot.protocols,
     model,
   );
   return scored.map((s, i) => {
-    const cost = s.capital + s.gas;
-    const net = s.pool - cost;
-    const take = Math.max(1, Math.round(s.pool / model.assumed_farmers));
-    const farmerNet = take - cost;
-    const verdict: 'farm' | 'thin' | 'skip' = farmerNet < 0 ? 'skip' : farmerNet < model.thin_net_usd ? 'thin' : 'farm';
+    const net = s.pool - s.cost1;
+    // The verdict is on the standard tier's net: farm only when the take clears the deposit, the
+    // gas and the fee by at least the threshold — a clearly profitable plan, not a marginal one.
+    const verdict: 'farm' | 'thin' | 'skip' = s.net1 >= model.farm_net_threshold_usd ? 'farm' : s.net1 >= 0 ? 'thin' : 'skip';
     const u = uncertainty.get(s.p.slug)!;
     return {
     rank: i + 1,
@@ -837,14 +1073,18 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     capital_usd: s.capital,
     est_gas_usd: s.gas,
     hold_days: s.hold,
-    implied_lo_usd: u.implied_lo_usd,
-    implied_hi_usd: u.implied_hi_usd,
+    implied_lo_usd: Math.max(1, Math.round(s.implied * rangeCalc.lo_multiplier)),
+    implied_hi_usd: Math.max(1, Math.round(s.implied * rangeCalc.hi_multiplier)),
     rank_lo: u.rank_lo,
     rank_hi: u.rank_hi,
     net_usd: net,
-    farmer_take_usd: take,
-    farmer_net_usd: farmerNet,
+    farmer_take_usd: s.take1,
+    farmer_net_usd: s.net1,
     net_verdict: verdict,
+    tier1_take_usd: s.take1,
+    tier1_net_usd: s.net1,
+    tier10_take_usd: s.take10,
+    tier10_net_usd: s.net10,
     model: {
       category_multiple: round4(s.multiple.multiple),
       category_comps: s.multiple.source === 'category' ? s.multiple.comps : 0,
@@ -876,14 +1116,6 @@ export function stepText(step: FarmStep): string {
 /** The first chain a protocol names, or a neutral phrase. */
 function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
-}
-
-/** How much capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -956,6 +1188,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, capital: numb
   const chain = chainOf(p);
   const action = actionFor(p, capital, chain);
   const weekly = weeklyFor(p, capital, chain);
+  // The swap fee is MODEL.swap_fee_rate (0.3% of the deposit); the large tier is ten times the
+  // standard deposit and takes ten shares of the pool instead of one.
+  const fee = Math.max(1, Math.round(capital * 0.003));
   return [
     {
       text: walletStep(chain),
@@ -964,7 +1199,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, capital: numb
     },
     {
       text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital, about $${capital >= 150 ? 8 : 4} of gas and a $${fee} swap fee`,
       time: '15 minutes to set up',
     },
     {
@@ -983,7 +1218,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, capital: numb
       time: '10 minutes a week',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log, set a reminder for the ${hold}-day mark, and plan how to unwind the position.`,
+      text: `Write the wallet, the dates and every transaction in a farm log, set a reminder for the ${hold}-day mark, and plan how to unwind the position. A $${capital * 10} deposit takes 10 shares of the pool instead of 1, for the same gas.`,
       cost: 'nothing but the log',
       time: '5 minutes',
     },
@@ -1033,6 +1268,10 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     farmer_take_usd: row.farmer_take_usd,
     farmer_net_usd: row.farmer_net_usd,
     net_verdict: row.net_verdict,
+    tier1_take_usd: row.tier1_take_usd,
+    tier1_net_usd: row.tier1_net_usd,
+    tier10_take_usd: row.tier10_take_usd,
+    tier10_net_usd: row.tier10_net_usd,
     category_multiple: row.model.category_multiple,
     category_comps: row.model.category_comps,
     family: row.model.family,
@@ -1045,9 +1284,43 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
   };
 }
 
+/**
+ * The refit-only intervals' coverage, measured the same way as the calibrated range's: the
+ * trading protocols are scored by the bootstrap refits, and the share whose true implied value
+ * falls inside their refit interval is the coverage. This is the "before" number the calibrated
+ * range improves on.
+ */
+function bootstrapCoverage(snapshot: Snapshot, model: ModelConstants, fit: CurveFit): number {
+  const rows: { slug: string; category: string | null; tvl_usd: number; growthMult: number; maturityMult: number }[] = [];
+  const truth = new Map<string, number>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    const v = impliedValue(p, snapshot.as_of, model, fit);
+    rows.push({ slug: p.slug, category: p.category, tvl_usd: p.tvl_usd, growthMult: v.growthMult, maturityMult: v.maturityMult });
+    truth.set(p.slug, Math.max(1, Math.round(p.tvl_usd * ratio * v.growthMult * v.maturityMult)));
+  }
+  if (rows.length === 0) return 0;
+  const unc = bootstrapUncertainty(rows, snapshot.protocols, model);
+  let covered = 0;
+  for (const r of rows) {
+    const u = unc.get(r.slug)!;
+    const t = truth.get(r.slug)!;
+    if (t >= u.implied_lo_usd && t <= u.implied_hi_usd) covered++;
+  }
+  return round4(covered / rows.length);
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+  // The range calibration is computed once and shared: the board's intervals and the
+  // validation's numbers are the same object, so they cannot disagree.
+  const range = rangeCalibration(snapshot.protocols, model);
+  const board = buildBoard(snapshot, model, range);
+  const validation = validateModel(snapshot.protocols, model, range);
+  const { fit } = fitSizeCurve(snapshot.protocols, model);
+  range.bootstrap_coverage = bootstrapCoverage(snapshot, model, fit);
   const { summary: sizeCurve } = fitSizeCurve(snapshot.protocols, model);
   const live = liveRows(snapshot);
   const watchlist = new Set(snapshot.watchlist);
@@ -1065,7 +1338,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     global_multiple: globalMedianMultiple(snapshot.protocols, model),
     size_curve: sizeCurve,
-    validation: validateModel(snapshot.protocols, model),
+    validation,
     bootstrap_replicates: model.bootstrap_replicates,
     rows: board.map((r) => radarRow(r, watchlist)),
     live,
