@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a filterable table, a per-protocol detail view with the model's own
 // inputs and the protocol's farm plan, and the model itself. No network: every byte it shows is in
 // data.js. The model below is the same arithmetic main.ts writes to board.json, so the page's code
@@ -7,8 +7,13 @@
 // What this page is: the board covers 40 of 40 watchlist protocols, ranked by an implied value —
 // TVL times a market multiple from the snapshot's own trading protocols, times seven-day growth,
 // times maturity with no token. Every row carries a six-step farm plan that states its capital, its
-// gas and its hold. Protocols whose token already trades are set aside in their own tab, where their
-// market-cap-to-TVL ratios are the comparables the model prices the board with.
+// gas and its hold, and a net: the assumed airdrop pool minus the farm cost, with a farm, thin or
+// skip verdict on one farmer's expected take. The multiple is tested, not trusted: leave-one-out
+// validation holds out one trading protocol at a time and predicts its multiple from the others, and
+// the model panel reports the error plainly. Every row also carries a rank interval from 200 refits
+// of the model, so the board says how rough its own ordering is. Protocols whose token already
+// trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables
+// the model prices the board with.
 (function () {
   'use strict';
 
@@ -45,7 +50,11 @@
   // comparables), else the median of the category's family pooled the same way, else the snapshot-wide
   // median; implied value is TVL times that multiple, times a growth multiplier from the seven-day
   // change, times a maturity multiplier from the age with no token. No protocol name is special-cased
-  // anywhere.
+  // anywhere. The net is the assumed airdrop pool (implied value times the assumed 7.5% community
+  // share) minus the farm cost (capital plus gas over the hold); the verdict is per farmer, on one
+  // farmer's expected take, which assumes the pool is split among 1,000 farmers. Rank intervals come
+  // from 200 refits of the same model with the comparables resampled, and are carried in the data
+  // beside each row; the page never refits the model itself.
   function multipleFor(row) {
     var category = row.category || 'Other';
     var own = MULT[category];
@@ -203,6 +212,7 @@
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'pool') { av = a.pool_usd; bv = b.pool_usd; }
+      else if (key === 'net') { av = a.net_usd; bv = b.net_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -275,7 +285,7 @@
     );
     chn.addEventListener('change', function () { state.chain = chn.value; writeHash(); render(); });
     var sort = el('select', { id: 'sort', 'aria-label': 'Sort the board' },
-      [['implied', 'Implied value'], ['pool', 'Airdrop pool'], ['tvl', 'TVL'], ['growth', '7-day growth'], ['age', 'Age'], ['name', 'Name']].map(function (o) {
+      [['implied', 'Implied value'], ['pool', 'Airdrop pool'], ['net', 'Net after cost'], ['tvl', 'TVL'], ['growth', '7-day growth'], ['age', 'Age'], ['name', 'Name']].map(function (o) {
         return el('option', { value: o[0], text: o[1], selected: o[0] === state.sort ? 'selected' : null });
       })
     );
@@ -325,25 +335,30 @@
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
+          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }),
+          el('span', { class: 'status ' + (WATCH[r.slug] ? 'watch' : 'early'), text: WATCH[r.slug] ? 'watchlist' : 'early' })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
+          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) }),
+          el('span', { class: 'range', text: 'rank ' + r.rank_lo + '–' + r.rank_hi })
         )),
         el('td', { class: 'num', text: fmtUsd(r.pool_usd) }),
         el('td', { class: 'num', text: '$' + r.capital_usd + ' + $' + r.est_gas_usd }),
-        el('td', null, el('span', { class: 'status watch', text: WATCH[r.slug] ? 'watchlist' : 'early' }))
+        el('td', null, el('div', { class: 'netcell' },
+          el('span', { class: 'num', text: fmtUsd(r.net_usd) }),
+          r.net_verdict === 'farm' ? null : el('span', { class: 'verdict ' + r.net_verdict, text: r.net_verdict })
+        ))
       );
       tbody.appendChild(tr);
     });
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Farm cost is the capital the plan needs plus the gas it spends over the hold; the pool is an assumed 7.5% community share, not a promise.' }),
+          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Farm cost is the capital the plan needs plus the gas it spends over the hold; the pool is an assumed 7.5% community share, not a promise. Net is that assumed pool minus the farm cost, and the verdict is per farmer: one farmer’s expected take assumes the pool is split among 1,000 farmers — farm if the take clears the cost by $100 or more, thin if it clears it by less, skip if it does not clear it at all. The rank range under each implied value is the rank interval from 200 refits of the model.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
@@ -353,7 +368,7 @@
             sortHeader('implied', 'Implied value'),
             sortHeader('pool', 'Assumed pool'),
             el('th', { scope: 'col', text: 'Farm cost' }),
-            el('th', { scope: 'col', text: 'Board' })
+            sortHeader('net', 'Net')
           )),
           tbody
         )
@@ -402,11 +417,14 @@
     });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { text: 'The board covers 40 of 40 watchlist protocols, ranked by an implied value: TVL times a market multiple from the snapshot\u2019s own trading protocols, times seven-day growth, times maturity with no token. Every row carries a six-step farm plan that states its capital, its gas and its hold. Protocols whose token already trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
+      el('p', { text: 'The board covers 40 of 40 watchlist protocols, ranked by an implied value: TVL times a market multiple from the snapshot\u2019s own trading protocols, times seven-day growth, times maturity with no token. Every row carries a six-step farm plan that states its capital, its gas and its hold, and a net: the assumed airdrop pool minus the farm cost, with a farm, thin or skip verdict on one farmer’s expected take. The multiple is tested, not trusted — leave-one-out validation holds out one trading protocol at a time and reports the error plainly — and every row carries a rank interval from 200 refits of the model. Protocols whose token already trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is the category\u2019s own market: the median market-cap-to-TVL ratio of the protocols in that category that already trade, where five or more such comparables exist; otherwise the median of the category\u2019s family of neighbouring categories pooled the same way; otherwise the snapshot-wide median of ' + DATA.global_multiple.toFixed(4) + 'x. Categories with no family multiple fall through to the snapshot-wide one.' }),
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
+      el('h3', { text: 'Validation: what the model gets wrong' }),
+      el('p', { text: 'Leave-one-out validation: each of the ' + DATA.validation.n + ' trading protocols with a market cap was held out in turn, and the model predicted its multiple from the remaining protocols using the same category, family and snapshot-wide rule. The median prediction error is ' + DATA.validation.median_abs_log_error.toFixed(2) + ' log points — about ' + Math.round(Math.exp(DATA.validation.median_abs_log_error)) + ' times the true multiple. ' + Math.round(DATA.validation.within_2x * 100) + '% of predictions land within twice the true multiple, ' + Math.round(DATA.validation.within_5x * 100) + '% within five times. ' + DATA.validation.by_source.category + ' predictions used a category median, ' + DATA.validation.by_source.family + ' a family median, ' + DATA.validation.by_source.global + ' the snapshot-wide median.' }),
+      el('p', { class: 'sub', text: 'That is the honest limit of the multiple: it is a category-typical price, not a per-protocol prediction, and individual multiples vary that much around their category median. The board is a rough ordering, and every row carries the rank interval its refits support — read the range, not just the rank.' }),
       el('h3', { text: 'Category multiples' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
@@ -422,9 +440,12 @@
           el('tbody', null, famRows)
         )
       ),
+      el('h3', { text: 'Rank ranges: how far a rank moves' }),
+      el('p', { text: 'The comparables are resampled with replacement and the model refit ' + DATA.bootstrap_replicates + ' times; each refit re-scores and re-ranks the whole board. A row’s implied-value range and rank range are the 10th to 90th percentile over those refits. The top row sits at rank ' + (DATA.rows[0] ? DATA.rows[0].rank_lo + '–' + DATA.rows[0].rank_hi : '—') + '; a mid-board row can move a hundred places. The point rank is the single best estimate; the range is how far it moves when the comparables shift.' }),
       el('ul', { class: 'caveats' },
         el('li', { text: 'Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
         el('li', { text: 'The pool is a labelled assumption: 7.5% of the implied value, the community’s share of a launch at a typical allocation. It is not a promise of any payout.' }),
+        el('li', { text: 'Net is the assumed pool minus the farm cost, and the verdict is per farmer: one farmer’s expected take assumes the pool is split among 1,000 farmers — farm if the take clears the cost by $100 or more, thin if it clears it by less, skip if it does not clear it at all. The pool total is large on every row; the verdict is what one farmer would actually keep.' }),
         el('li', { text: '“No token” means the snapshot records none. A protocol on this board may still have a token its DefiLlama record does not carry.' }),
         el('li', { text: 'The early radar is every rankable pre-token protocol below the watchlist floor, at any TVL; exchanges, versioned pools and wrapped, staked or bridged products of a token that trades are kept out by the watchlist’s own rule.' })
       )
@@ -469,8 +490,19 @@
         el('div', null, el('span', { text: 'Capital' }), el('b', { class: 'num', text: '$' + row.capital_usd })),
         el('div', null, el('span', { text: 'Gas over the hold' }), el('b', { class: 'num', text: 'about $' + row.est_gas_usd })),
         el('div', null, el('span', { text: 'Hold' }), el('b', { class: 'num', text: row.hold_days + ' days' })),
-        el('div', null, el('span', { text: 'Weekly time' }), el('b', { class: 'num', text: 'about 10 min' }))
-      )
+        el('div', null, el('span', { text: 'Weekly time' }), el('b', { class: 'num', text: 'about 10 min' })),
+        el('div', null, el('span', { text: 'Assumed airdrop pool' }), el('b', { class: 'num', text: fmtUsd(row.pool_usd) })),
+        el('div', { class: 'total' }, el('span', { text: 'Net after farming' }), el('b', { class: 'num', text: fmtUsd(row.net_usd) }))
+      ),
+      el('p', { class: 'sub', text: 'One farmer’s expected take is ' + fmtUsd(row.farmer_take_usd) + ', assuming the pool is split among 1,000 farmers, against a farm cost of $' + (row.capital_usd + row.est_gas_usd) + '. Verdict: ' + (row.net_verdict === 'farm' ? 'farm — the take clears the cost by ' + fmtUsd(row.farmer_net_usd) + '.' : row.net_verdict === 'thin' ? 'thin — the take clears the cost by only ' + fmtUsd(row.farmer_net_usd) + '.' : 'skip — the take does not cover the cost, short by ' + fmtUsd(-row.farmer_net_usd) + '.') })
+    ));
+    dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'How sure is this rank?' }),
+      el('div', { class: 'costline' },
+        el('div', null, el('span', { text: 'Implied value range' }), el('b', { class: 'num', text: fmtUsd(row.implied_lo_usd) + ' – ' + fmtUsd(row.implied_hi_usd) })),
+        el('div', null, el('span', { text: 'Rank range' }), el('b', { class: 'num', text: 'rank ' + row.rank_lo + '–' + row.rank_hi }))
+      ),
+      el('p', { class: 'sub', text: 'The range is the 10th to 90th percentile over ' + DATA.bootstrap_replicates + ' refits of the same model, each fit on the comparables resampled with replacement and re-ranked. The point rank above is the single best estimate; the range is how far it moves when the comparables shift.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),

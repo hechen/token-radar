@@ -1,4 +1,4 @@
-// The token radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the watchlist's own quality rule keeps, at any TVL: the early rows the
@@ -23,9 +23,27 @@
 // future snapshot with different comparables re-ranks the board without a single name being touched.
 // The dashboard states the multiple and its comparable count for every category and family it uses.
 //
+// The multiple is tested, not trusted: leave-one-out validation holds out one trading protocol at a
+// time and predicts its market multiple from the others, by the same category-family-global rule the
+// board uses; the dashboard reports how many were held out, the median absolute log error of the
+// prediction, and the share predicted within 2x and 5x. A multiple the comparables cannot predict
+// shows up there, in the open, rather than hiding inside the ranking.
+//
+// The ranking carries its own uncertainty: the model is refit 200 times, each time resampling the
+// comparables with replacement (a seeded generator, so the build is deterministic), and every row
+// gets an implied-value interval and a rank interval — the 10th and 90th percentiles of its 200
+// refits. A row ranked 3rd with a rank interval of 2-7 is a strong row with an honest margin, not a
+// false precision.
+//
 // The airdrop pool is a labelled assumption, never a promise: pool = implied x POOL_SHARE, the
 // community's share of a launch at a typical 7.5% allocation. Farm cost is the capital the plan
-// needs plus the gas the plan spends over its hold.
+// needs plus the gas the plan spends over its hold. The net is the pool minus that farm cost, and
+// the verdict is per farmer: one farmer's expected take assumes the pool is split among
+// ASSUMED_FARMERS farmers, so take = pool / ASSUMED_FARMERS; farm when the take clears the farm
+// cost by at least THIN_NET_USD, thin when it clears it by less, skip when it does not clear it at
+// all. The farmer count is a labelled assumption like the pool share, stated wherever the verdict
+// appears; the whole-pool net and the per-farmer take are both shown, so the arithmetic can be
+// checked either way.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -63,6 +81,9 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   pool_share: number;
+  assumed_farmers: number;
+  thin_net_usd: number;
+  bootstrap_replicates: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -77,10 +98,13 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.05,
   multiple_cap: 1.0,
   pool_share: 0.075,
+  assumed_farmers: 1000,
+  thin_net_usd: 100,
+  bootstrap_replicates: 200,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -112,6 +136,14 @@ export interface BoardRow {
   capital_usd: number;
   est_gas_usd: number;
   hold_days: number;
+  implied_lo_usd: number;
+  implied_hi_usd: number;
+  rank_lo: number;
+  rank_hi: number;
+  net_usd: number;
+  farmer_take_usd: number;
+  farmer_net_usd: number;
+  net_verdict: 'farm' | 'thin' | 'skip';
   model: {
     category_multiple: number;
     category_comps: number;
@@ -145,6 +177,14 @@ export interface RadarRow {
   capital_usd: number;
   est_gas_usd: number;
   hold_days: number;
+  implied_lo_usd: number;
+  implied_hi_usd: number;
+  rank_lo: number;
+  rank_hi: number;
+  net_usd: number;
+  farmer_take_usd: number;
+  farmer_net_usd: number;
+  net_verdict: 'farm' | 'thin' | 'skip';
   category_multiple: number;
   category_comps: number;
   family: string | null;
@@ -182,6 +222,28 @@ export interface FamilyMultiple {
   comps: number;
 }
 
+/** Leave-one-out validation of the multiple estimator, computed from this snapshot at build time. */
+export interface ValidationResult {
+  /** Token-bearing protocols held out one at a time and predicted. */
+  n: number;
+  /** Median |ln(predicted multiple / actual multiple)| over the held-out protocols. */
+  median_abs_log_error: number;
+  /** Share of held-out protocols predicted within 2x (absolute log error under ln 2). */
+  within_2x: number;
+  /** Share of held-out protocols predicted within 5x (absolute log error under ln 5). */
+  within_5x: number;
+  /** How many held-out protocols each resolution source predicted. */
+  by_source: { category: number; family: number; global: number };
+}
+
+/** One row's refit intervals: the 10th and 90th percentiles of its bootstrap refits. */
+export interface RowUncertainty {
+  implied_lo_usd: number;
+  implied_hi_usd: number;
+  rank_lo: number;
+  rank_hi: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, the multiples and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -197,6 +259,8 @@ export interface RadarData {
   global_multiple: number;
   multiples: CategoryMultiple[];
   families: FamilyMultiple[];
+  validation: ValidationResult;
+  bootstrap_replicates: number;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -356,6 +420,171 @@ export function impliedValue(
   return { implied, multiple, growthPct, growthMult, maturityMult, age };
 }
 
+/** The raw market-cap-to-TVL ratio lists the multiples are medians of, by category, by family and snapshot-wide. */
+function ratioLists(protocols: SnapshotProtocol[]): { byCategory: Map<string, number[]>; byFamily: Map<string, number[]>; global: number[] } {
+  const byCategory = new Map<string, number[]>();
+  const global: number[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    global.push(ratio);
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key) ?? [];
+    list.push(ratio);
+    byCategory.set(key, list);
+  }
+  const byFamily = new Map<string, number[]>();
+  for (const [family, members] of Object.entries(FAMILIES)) {
+    const pooled = members.flatMap((c) => byCategory.get(c) ?? []);
+    if (pooled.length > 0) byFamily.set(family, pooled);
+  }
+  return { byCategory, byFamily, global };
+}
+
+/** A copy of `list` with one occurrence of `value` removed (the first). */
+function withoutOne(list: number[], value: number): number[] {
+  const at = list.indexOf(value);
+  if (at < 0) return [...list];
+  const copy = [...list];
+  copy.splice(at, 1);
+  return copy;
+}
+
+/**
+ * Leave-one-out validation of the multiple estimator: each token-bearing protocol is held out in
+ * turn and its market multiple is predicted from the others, by the same category-family-global
+ * rule the board uses (a category that drops below five comparables without it falls through to
+ * its family, exactly as the board would). The error is the absolute log error of the predicted
+ * multiple against the protocol's own market-cap-to-TVL ratio: a log error of 0.69 means a 2x miss.
+ * Everything is computed from this snapshot at build time; nothing about the result is written in.
+ */
+export function validateModel(protocols: SnapshotProtocol[], model: ModelConstants): ValidationResult {
+  const lists = ratioLists(protocols);
+  const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
+  const errors: number[] = [];
+  const bySource = { category: 0, family: 0, global: 0 };
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    const key = p.category ?? 'Other';
+    const catList = withoutOne(lists.byCategory.get(key) ?? [], ratio);
+    let predicted: number | null = null;
+    let source: 'category' | 'family' | 'global';
+    if (catList.length >= model.min_comps) {
+      predicted = clamp(median(catList));
+      source = 'category';
+    } else {
+      const fam = familyOf(p.category);
+      const famList = fam === null ? [] : withoutOne(lists.byFamily.get(fam) ?? [], ratio);
+      if (famList.length >= model.min_comps) {
+        predicted = clamp(median(famList));
+        source = 'family';
+      } else {
+        const globalList = withoutOne(lists.global, ratio);
+        if (globalList.length === 0) continue;
+        predicted = clamp(median(globalList));
+        source = 'global';
+      }
+    }
+    bySource[source]++;
+    errors.push(Math.abs(Math.log(predicted / ratio)));
+  }
+  errors.sort((a, b) => a - b);
+  const n = errors.length;
+  const medianErr = n === 0 ? 0 : median(errors);
+  const within = (bound: number): number => (n === 0 ? 0 : round4(errors.filter((e) => e < bound).length / n));
+  return {
+    n,
+    median_abs_log_error: round4(medianErr),
+    within_2x: within(Math.LN2),
+    within_5x: within(Math.log(5)),
+    by_source: bySource,
+  };
+}
+
+/** A small deterministic generator (mulberry32): the refits are seeded, so the build is byte-identical run to run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** One bootstrap resample of a list: the same length, drawn with replacement. */
+function resample(list: number[], rand: () => number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < list.length; i++) out.push(list[Math.floor(rand() * list.length)]!);
+  return out;
+}
+
+/** The 10th and 90th percentiles of a sorted list, by nearest rank. */
+function deciles(sorted: number[]): [number, number] {
+  const lo = sorted[Math.floor(0.1 * (sorted.length - 1))]!;
+  const hi = sorted[Math.floor(0.9 * (sorted.length - 1))]!;
+  return [lo, hi];
+}
+
+/**
+ * The board's refit intervals: the model is refit `replicates` times, each time resampling every
+ * comparable list with replacement and recomputing the medians by the same rules, then every row is
+ * re-scored and the board re-ranked. Each row's implied-value interval and rank interval are the
+ * 10th and 90th percentiles of its refits. The point ranking never moves — only the intervals are
+ * added — and the generator is seeded, so two builds agree byte for byte.
+ */
+export function bootstrapUncertainty(
+  rows: { slug: string; category: string | null; tvl_usd: number; growthMult: number; maturityMult: number }[],
+  protocols: SnapshotProtocol[],
+  model: ModelConstants,
+): Map<string, RowUncertainty> {
+  const lists = ratioLists(protocols);
+  const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
+  const rand = mulberry32(0x9e3779b9);
+  const replicates = model.bootstrap_replicates;
+  const impliedRuns = new Map<string, number[]>();
+  const rankRuns = new Map<string, number[]>();
+  for (const r of rows) {
+    impliedRuns.set(r.slug, []);
+    rankRuns.set(r.slug, []);
+  }
+  const categories = [...lists.byCategory.keys()].sort();
+  const families = [...lists.byFamily.keys()].sort();
+  for (let b = 0; b < replicates; b++) {
+    const bootCat = new Map<string, CategoryMultiple>();
+    for (const c of categories) {
+      const list = lists.byCategory.get(c)!;
+      if (list.length >= model.min_comps) bootCat.set(c, { category: c, multiple: clamp(median(resample(list, rand))), comps: list.length, fallback: false });
+    }
+    const bootFam = new Map<string, FamilyMultiple>();
+    for (const f of families) {
+      const list = lists.byFamily.get(f)!;
+      if (list.length >= model.min_comps) bootFam.set(f, { family: f, multiple: clamp(median(resample(list, rand))), comps: list.length });
+    }
+    const bootGlobal = lists.global.length > 0 ? clamp(median(resample(lists.global, rand))) : 0.2;
+    const boot: Multiples = { byCategory: bootCat, byFamily: bootFam, global: bootGlobal };
+    const scored = rows.map((r) => {
+      const mult = multipleFor(r.category, boot).multiple;
+      return { slug: r.slug, implied: Math.max(1, Math.round(r.tvl_usd * mult * r.growthMult * r.maturityMult)) };
+    });
+    for (const s of scored) impliedRuns.get(s.slug)!.push(s.implied);
+    const ranked = [...scored].sort((a, z) => z.implied - a.implied || (a.slug < z.slug ? -1 : a.slug > z.slug ? 1 : 0));
+    ranked.forEach((s, i) => rankRuns.get(s.slug)!.push(i + 1));
+  }
+  const out = new Map<string, RowUncertainty>();
+  for (const r of rows) {
+    const imp = [...impliedRuns.get(r.slug)!].sort((a, z) => a - z);
+    const rk = [...rankRuns.get(r.slug)!].sort((a, z) => a - z);
+    const [ilo, ihi] = deciles(imp);
+    const [rlo, rhi] = deciles(rk);
+    out.set(r.slug, { implied_lo_usd: ilo, implied_hi_usd: ihi, rank_lo: rlo, rank_hi: rhi });
+  }
+  return out;
+}
+
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 /** The watchlist's wrapped, staked and bridged exclusions, by category. */
@@ -437,7 +666,19 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
+  const uncertainty = bootstrapUncertainty(
+    scored.map((s) => ({ slug: s.p.slug, category: s.p.category, tvl_usd: s.p.tvl_usd, growthMult: s.growthMult, maturityMult: s.maturityMult })),
+    snapshot.protocols,
+    model,
+  );
+  return scored.map((s, i) => {
+    const cost = s.capital + s.gas;
+    const net = s.pool - cost;
+    const take = Math.max(1, Math.round(s.pool / model.assumed_farmers));
+    const farmerNet = take - cost;
+    const verdict: 'farm' | 'thin' | 'skip' = farmerNet < 0 ? 'skip' : farmerNet < model.thin_net_usd ? 'thin' : 'farm';
+    const u = uncertainty.get(s.p.slug)!;
+    return {
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -456,6 +697,14 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     capital_usd: s.capital,
     est_gas_usd: s.gas,
     hold_days: s.hold,
+    implied_lo_usd: u.implied_lo_usd,
+    implied_hi_usd: u.implied_hi_usd,
+    rank_lo: u.rank_lo,
+    rank_hi: u.rank_hi,
+    net_usd: net,
+    farmer_take_usd: take,
+    farmer_net_usd: farmerNet,
+    net_verdict: verdict,
     model: {
       category_multiple: round4(s.multiple.multiple),
       category_comps: s.multiple.source === 'category' ? s.multiple.comps : 0,
@@ -470,7 +719,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age, s.capital, s.hold).map(stepText),
-  }));
+    };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -635,6 +885,14 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     capital_usd: row.capital_usd,
     est_gas_usd: row.est_gas_usd,
     hold_days: row.hold_days,
+    implied_lo_usd: row.implied_lo_usd,
+    implied_hi_usd: row.implied_hi_usd,
+    rank_lo: row.rank_lo,
+    rank_hi: row.rank_hi,
+    net_usd: row.net_usd,
+    farmer_take_usd: row.farmer_take_usd,
+    farmer_net_usd: row.farmer_net_usd,
+    net_verdict: row.net_verdict,
     category_multiple: row.model.category_multiple,
     category_comps: row.model.category_comps,
     family: row.model.family,
@@ -672,6 +930,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     global_multiple: multiples.global,
     multiples: multiplesList,
     families: familiesList,
+    validation: validateModel(snapshot.protocols, model),
+    bootstrap_replicates: model.bootstrap_replicates,
     rows: board.map((r) => radarRow(r, watchlist)),
     live,
   };
