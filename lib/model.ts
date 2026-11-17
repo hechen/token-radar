@@ -11,7 +11,9 @@
 //
 //   multiple   = the category's own market multiple: the median market-cap-to-TVL ratio of the
 //                token-bearing protocols in the same category, where at least five such comparables
-//                exist; otherwise the whole snapshot's median ratio. Clamped to [0.05, 1.0].
+//                exist; otherwise the median of the category's family — a group of neighbouring
+//                categories pooled the same way, where at least five pooled comparables exist;
+//                otherwise the whole snapshot's median ratio. Clamped to [0.05, 1.0].
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
@@ -19,7 +21,7 @@
 //
 // The multiple is what makes this model dynamic: it is computed from the snapshot at run time, so a
 // future snapshot with different comparables re-ranks the board without a single name being touched.
-// The dashboard states the multiple and its comparable count for every category it uses.
+// The dashboard states the multiple and its comparable count for every category and family it uses.
 //
 // The airdrop pool is a labelled assumption, never a promise: pool = implied x POOL_SHARE, the
 // community's share of a launch at a typical 7.5% allocation. Farm cost is the capital the plan
@@ -113,6 +115,10 @@ export interface BoardRow {
   model: {
     category_multiple: number;
     category_comps: number;
+    family: string | null;
+    family_multiple: number | null;
+    family_comps: number;
+    multiple_source: 'category' | 'family' | 'global';
     global_multiple: number;
     growth_pct: number;
     growth_multiplier: number;
@@ -141,8 +147,13 @@ export interface RadarRow {
   hold_days: number;
   category_multiple: number;
   category_comps: number;
+  family: string | null;
+  family_multiple: number | null;
+  family_comps: number;
+  multiple_source: 'category' | 'family' | 'global';
   growth_multiplier: number;
   maturity_multiplier: number;
+  watchlist: boolean;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -164,6 +175,13 @@ export interface CategoryMultiple {
   fallback: boolean;
 }
 
+/** One family's market multiple: the pooled median of its member categories' live ratios. */
+export interface FamilyMultiple {
+  family: string;
+  multiple: number;
+  comps: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, the multiples and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -171,12 +189,14 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  watchlist: string[];
   watchlist_size: number;
   board_size: number;
   early_size: number;
   live_size: number;
   global_multiple: number;
   multiples: CategoryMultiple[];
+  families: FamilyMultiple[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -213,15 +233,60 @@ function median(values: number[]): number {
 }
 
 /**
+ * The families: neighbouring categories pooled when a category has too few live comparables of its
+ * own. Each category sits in exactly one family; a family with no live comparables at all (Stable-like
+ * here) simply has no multiple, and its rows fall through to the snapshot-wide one. The families are
+ * named by what their members do — the multiples are computed from this snapshot at build time, never
+ * written in: a future snapshot re-pools them without a single name being touched.
+ */
+export const FAMILIES: Record<string, string[]> = {
+  'Lending-like': ['Lending', 'CDP', 'CDP Manager', 'Collateral Management', 'Collateral Markets', 'Uncollateralized Lending'],
+  'Yield-like': ['Yield', 'Yield Aggregator', 'Risk Curators', 'Onchain Capital Allocator', 'Staking Pool', 'Farm'],
+  'Bridge-like': ['Bridge', 'Canonical Bridge', 'Cross Chain Bridge'],
+  'Staking-like': ['Liquid Staking', 'Restaking', 'Liquid Restaking', 'Restaked BTC'],
+  'RWA-like': ['RWA', 'Basis Trading', 'Token Locker', 'Dual-Token Stablecoin'],
+  'DEX-like': ['Dexs', 'Derivatives', 'Synthetics', 'Options', 'Options Vault', 'Interest Rate Derivatives', 'Leveraged Farming', 'Liquidity Manager'],
+  'Stable-like': ['Algo-Stables', 'Stablecoin Issuer', 'Stablecoin Wrapper', 'Reserve Currency'],
+  Other: ['Prediction Market', 'Privacy', 'Payments', 'Indexes', 'Launchpad', 'Chain', 'CeDeFi', 'AI Agents', 'Decentralized AI', 'NFT Marketplace', 'OTC Marketplace', 'Governance Incentives', 'DOR'],
+};
+
+/** A category's family, or null when no family claims it. */
+export function familyOf(category: string | null): string | null {
+  if (category === null) return null;
+  for (const [family, members] of Object.entries(FAMILIES)) {
+    if (members.includes(category)) return family;
+  }
+  return null;
+}
+
+/** Where one row's multiple came from: its own category, its family, or the snapshot-wide one. */
+export interface MultipleResolution {
+  multiple: number;
+  comps: number;
+  source: 'category' | 'family' | 'global';
+  family: string | null;
+  category: string;
+}
+
+export interface Multiples {
+  byCategory: Map<string, CategoryMultiple>;
+  byFamily: Map<string, FamilyMultiple>;
+  global: number;
+}
+
+/**
  * The market multiples, computed from the snapshot's own token-bearing protocols: for each category
  * the median market-cap-to-TVL ratio of its protocols that already trade, where at least
- * `model.min_comps` such comparables exist; otherwise the snapshot-wide median. Both are clamped to
- * the model's multiple band. No name is ever consulted here: only figures.
+ * `model.min_comps` such comparables exist; for each family the same median over its member
+ * categories pooled, where at least `model.min_comps` pooled comparables exist; otherwise the
+ * snapshot-wide median. All three are clamped to the model's multiple band. No name is ever
+ * consulted here: only figures. A wild single comparable (one protocol trading at 400x its TVL)
+ * cannot move a median, and a family below the floor never supplies one.
  */
 export function marketMultiples(
   protocols: SnapshotProtocol[],
   model: ModelConstants,
-): { byCategory: Map<string, CategoryMultiple>; global: number } {
+): Multiples {
   const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
   const ratiosByCategory = new Map<string, number[]>();
   const allRatios: number[] = [];
@@ -242,17 +307,28 @@ export function marketMultiples(
       byCategory.set(category, { category, multiple: clamp(median(ratios)), comps: ratios.length, fallback: false });
     }
   }
-  return { byCategory, global };
+  const byFamily = new Map<string, FamilyMultiple>();
+  for (const [family, members] of Object.entries(FAMILIES)) {
+    const pooled = members.flatMap((c) => ratiosByCategory.get(c) ?? []);
+    if (pooled.length >= model.min_comps) {
+      byFamily.set(family, { family, multiple: clamp(median(pooled)), comps: pooled.length });
+    }
+  }
+  return { byCategory, byFamily, global };
 }
 
-/** A category's multiple: its own, where it has enough comparables, else the snapshot-wide one. */
+/** A row's multiple: its category's own, where it has enough comparables, else its family's pooled one, else the snapshot-wide one. */
 export function multipleFor(
   category: string | null,
-  multiples: { byCategory: Map<string, CategoryMultiple>; global: number },
-): CategoryMultiple {
+  multiples: Multiples,
+): MultipleResolution {
+  const name = category ?? 'Other';
   const own = category === null ? undefined : multiples.byCategory.get(category);
-  if (own !== undefined) return own;
-  return { category: category ?? 'Other', multiple: multiples.global, comps: 0, fallback: true };
+  if (own !== undefined) return { multiple: own.multiple, comps: own.comps, source: 'category', family: null, category: name };
+  const family = familyOf(category);
+  const pooled = family === null ? undefined : multiples.byFamily.get(family);
+  if (pooled !== undefined) return { multiple: pooled.multiple, comps: pooled.comps, source: 'family', family, category: name };
+  return { multiple: multiples.global, comps: 0, source: 'global', family, category: name };
 }
 
 /** The multipliers and the implied value one protocol gets under `model`. */
@@ -260,10 +336,10 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  multiples: { byCategory: Map<string, CategoryMultiple>; global: number },
+  multiples: Multiples,
 ): {
   implied: number;
-  multiple: CategoryMultiple;
+  multiple: MultipleResolution;
   growthPct: number;
   growthMult: number;
   maturityMult: number;
@@ -341,6 +417,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const { implied, multiple, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, multiples);
+    const familyEntry = multiple.family !== null ? multiples.byFamily.get(multiple.family) : undefined;
     const capital = capitalFor(p);
     const hold = holdDaysFor(age);
     const weeks = Math.max(1, Math.ceil(hold / 7));
@@ -348,6 +425,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       p,
       implied,
       multiple,
+      familyEntry,
       growthPct,
       growthMult,
       maturityMult,
@@ -380,7 +458,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     hold_days: s.hold,
     model: {
       category_multiple: round4(s.multiple.multiple),
-      category_comps: s.multiple.fallback ? 0 : s.multiple.comps,
+      category_comps: s.multiple.source === 'category' ? s.multiple.comps : 0,
+      family: s.multiple.family,
+      family_multiple: s.familyEntry !== undefined ? round4(s.familyEntry.multiple) : null,
+      family_comps: s.familyEntry !== undefined ? s.familyEntry.comps : 0,
+      multiple_source: s.multiple.source,
       global_multiple: multiples.global,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
@@ -441,6 +523,9 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('privacy')) return `Deposit $${capital} into ${name}'s shielded pool on ${chain} and keep the receipt.`;
   if (c.includes('payment')) return `Route $${capital} of real payment volume through ${name} on ${chain} over the hold.`;
   if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
+  if (c.includes('btc')) return `Mint $${capital} of the BTC-pegged asset through ${name} on ${chain} and hold it.`;
+  if (c.includes('liquidity manager')) return `Deposit $${capital} into a ${name} managed liquidity position on ${chain} and keep it in range.`;
+  if (c.includes('farm')) return `Deposit $${capital} into the ${name} farm on ${chain} and keep the position open.`;
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
@@ -457,7 +542,20 @@ function weeklyFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('rwa') || c.includes('basis') || c.includes('index')) return `Add at least $25 to the ${name} position on ${chain} each week and leave it staked.`;
   if (c.includes('privacy')) return `Make one shielded deposit or withdrawal through ${name} each week, from the same farming wallet.`;
   if (c.includes('payment')) return `Send at least one real payment through ${name} on ${chain} each week, to a different counterparty.`;
+  if (c.includes('btc')) return `Move at least $25 of the BTC-pegged position through ${name} each week — mint, redeem or bridge a small amount — so the position shows use.`;
+  if (c.includes('staking') || c.includes('restak')) return `Restake the week's rewards on ${name}, or add at least $25 of the staking asset, so the staked balance grows every week.`;
+  if (c.includes('stable')) return `Hold the stable balance through ${name} and swap at least $25 through its pool on ${chain} each week, so the position shows use.`;
+  if (c.includes('insurance')) return `Check the ${name} policy each week and keep the cover funded; if the cover lapses, buy it again before the week's snapshot.`;
+  if (c.includes('liquidity manager')) return `Rebalance the ${name} position on ${chain} each week, moving the range to where the fees are, and compound at least $25 of the fees earned.`;
+  if (c.includes('farm')) return `Harvest the farm's rewards on ${name} each week and redeposit at least $25 of them, so the farmed balance compounds.`;
   return `Make one qualifying action on ${name} each week, such as a deposit, a swap, a vote or a claim.`;
+}
+
+/** The wallet to farm with: a Solana or Bitcoin wallet where the chain has its own, else a fresh wallet on that chain. */
+function walletStep(chain: string): string {
+  if (chain === 'Solana') return 'Use a fresh Solana wallet that holds only the funds you plan to farm, and keep its seed phrase offline.';
+  if (chain === 'Bitcoin') return 'Use a fresh Bitcoin wallet that holds only the funds you plan to farm, and keep its seed phrase offline.';
+  return `Use a fresh wallet on ${chain} that holds only the funds you plan to farm, and keep its seed phrase offline.`;
 }
 
 /**
@@ -470,7 +568,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, capital: numb
   const weekly = weeklyFor(p, capital, chain);
   return [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
+      text: walletStep(chain),
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
@@ -520,7 +618,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -539,8 +637,13 @@ export function radarRow(row: BoardRow): RadarRow {
     hold_days: row.hold_days,
     category_multiple: row.model.category_multiple,
     category_comps: row.model.category_comps,
+    family: row.model.family,
+    family_multiple: row.model.family_multiple,
+    family_comps: row.model.family_comps,
+    multiple_source: row.model.multiple_source,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    watchlist: watchlist.has(row.slug),
   };
 }
 
@@ -549,22 +652,27 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const multiples = marketMultiples(snapshot.protocols, model);
   const live = liveRows(snapshot);
-  const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const watchlist = new Set(snapshot.watchlist);
+  const early = board.filter((r) => !watchlist.has(r.slug)).length;
   const multiplesList: CategoryMultiple[] = [...multiples.byCategory.values()]
     .sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
+  const familiesList: FamilyMultiple[] = [...multiples.byFamily.values()]
+    .sort((a, b) => b.multiple - a.multiple || (a.family < b.family ? -1 : 1));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
     live_size: live.length,
     global_multiple: multiples.global,
     multiples: multiplesList,
-    rows: board.map(radarRow),
+    families: familiesList,
+    rows: board.map((r) => radarRow(r, watchlist)),
     live,
   };
   return { board, radar };

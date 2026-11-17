@@ -3,6 +3,12 @@
 // inputs and the protocol's farm plan, and the model itself. No network: every byte it shows is in
 // data.js. The model below is the same arithmetic main.ts writes to board.json, so the page's code
 // and the board's data are visibly the same function of the snapshot's figures.
+//
+// What this page is: the board covers 40 of 40 watchlist protocols, ranked by an implied value —
+// TVL times a market multiple from the snapshot's own trading protocols, times seven-day growth,
+// times maturity with no token. Every row carries a six-step farm plan that states its capital, its
+// gas and its hold. Protocols whose token already trades are set aside in their own tab, where their
+// market-cap-to-TVL ratios are the comparables the model prices the board with.
 (function () {
   'use strict';
 
@@ -11,9 +17,11 @@
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', chain: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
   var WATCH = {};
-  DATA.rows.forEach(function (r) { WATCH[r.slug] = true; });
+  (DATA.watchlist || []).forEach(function (s) { WATCH[s] = true; });
   var MULT = {};
   DATA.multiples.forEach(function (m) { MULT[m.category] = m; });
+  var FAM = {};
+  (DATA.families || []).forEach(function (f) { FAM[f.family] = f; });
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -34,16 +42,25 @@
   }
   // The model in two functions, the same as lib/model.ts: a category's market multiple is the median
   // market-cap-to-TVL ratio of the snapshot's token-bearing protocols in that category (five or more
-  // comparables), else the snapshot-wide median; implied value is TVL times that multiple, times a
-  // growth multiplier from the seven-day change, times a maturity multiplier from the age with no
-  // token. No protocol name is special-cased anywhere.
-  function multipleFor(category) {
-    var own = MULT[category || 'Other'];
-    if (own && own.comps >= DATA.model.min_comps) return { multiple: own.multiple, comps: own.comps, fallback: false };
-    return { multiple: DATA.global_multiple, comps: 0, fallback: true };
+  // comparables), else the median of the category's family pooled the same way, else the snapshot-wide
+  // median; implied value is TVL times that multiple, times a growth multiplier from the seven-day
+  // change, times a maturity multiplier from the age with no token. No protocol name is special-cased
+  // anywhere.
+  function multipleFor(row) {
+    var category = row.category || 'Other';
+    var own = MULT[category];
+    if (own && own.comps >= DATA.model.min_comps) return { multiple: own.multiple, comps: own.comps, source: 'category', label: category };
+    var fam = row.family ? FAM[row.family] : null;
+    if (fam && fam.comps >= DATA.model.min_comps) return { multiple: fam.multiple, comps: fam.comps, source: 'family', label: row.family };
+    return { multiple: DATA.global_multiple, comps: 0, source: 'global', label: 'snapshot-wide' };
+  }
+  function multipleText(row) {
+    var m = multipleFor(row);
+    if (m.source === 'global') return m.multiple.toFixed(3) + 'x snapshot-wide';
+    return m.multiple.toFixed(3) + 'x ' + m.label + ', ' + m.comps + ' comps';
   }
   function impliedOf(row, model) {
-    var mult = multipleFor(row.category).multiple;
+    var mult = multipleFor(row).multiple;
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
@@ -93,6 +110,9 @@
     if (c.indexOf('privacy') >= 0) return 'Deposit $' + capital + " into " + name + "'s shielded pool on " + chain + ' and keep the receipt.';
     if (c.indexOf('payment') >= 0) return 'Route $' + capital + ' of real payment volume through ' + name + ' on ' + chain + ' over the hold.';
     if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.';
+    if (c.indexOf('btc') >= 0) return 'Mint $' + capital + ' of the BTC-pegged asset through ' + name + ' on ' + chain + ' and hold it.';
+    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' managed liquidity position on ' + chain + ' and keep it in range.';
+    if (c.indexOf('farm') >= 0) return 'Deposit $' + capital + ' into the ' + name + ' farm on ' + chain + ' and keep the position open.';
     return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
   }
   function weeklyFor(p, capital, chain) {
@@ -107,6 +127,12 @@
     if (c.indexOf('rwa') >= 0 || c.indexOf('basis') >= 0 || c.indexOf('index') >= 0) return 'Add at least $25 to the ' + name + ' position on ' + chain + ' each week and leave it staked.';
     if (c.indexOf('privacy') >= 0) return 'Make one shielded deposit or withdrawal through ' + name + ' each week, from the same farming wallet.';
     if (c.indexOf('payment') >= 0) return 'Send at least one real payment through ' + name + ' on ' + chain + ' each week, to a different counterparty.';
+    if (c.indexOf('btc') >= 0) return 'Move at least $25 of the BTC-pegged position through ' + name + ' each week — mint, redeem or bridge a small amount — so the position shows use.';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return "Restake the week's rewards on " + name + ', or add at least $25 of the staking asset, so the staked balance grows every week.';
+    if (c.indexOf('stable') >= 0) return 'Hold the stable balance through ' + name + ' and swap at least $25 through its pool on ' + chain + ' each week, so the position shows use.';
+    if (c.indexOf('insurance') >= 0) return "Check the " + name + " policy each week and keep the cover funded; if the cover lapses, buy it again before the week's snapshot.";
+    if (c.indexOf('liquidity manager') >= 0) return 'Rebalance the ' + name + ' position on ' + chain + ' each week, moving the range to where the fees are, and compound at least $25 of the fees earned.';
+    if (c.indexOf('farm') >= 0) return "Harvest the farm's rewards on " + name + ' each week and redeposit at least $25 of them, so the farmed balance compounds.';
     return 'Make one qualifying action on ' + name + ' each week, such as a deposit, a swap, a vote or a claim.';
   }
   function stepText(step) {
@@ -115,12 +141,17 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
+  function walletStep(chain) {
+    if (chain === 'Solana') return 'Use a fresh Solana wallet that holds only the funds you plan to farm, and keep its seed phrase offline.';
+    if (chain === 'Bitcoin') return 'Use a fresh Bitcoin wallet that holds only the funds you plan to farm, and keep its seed phrase offline.';
+    return 'Use a fresh wallet on ' + chain + ' that holds only the funds you plan to farm, and keep its seed phrase offline.';
+  }
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = p.capital_usd;
     var hold = p.hold_days;
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
+      { text: walletStep(chain), cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
       { text: weeklyFor(p, capital, chain), cost: 'about $2 of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
@@ -199,7 +230,7 @@
           'Every protocol with at least ', el('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }),
           ' of TVL and no token on record, ranked by what its launch would be worth. The early radar adds ',
           el('b', { text: String(DATA.early_size) }),
-          ' pre-token protocols below that floor, so a launch is found early, not after it trends. Implied value is a model, not a promise.'
+          ' pre-token protocols below that floor. Implied value is a model, not a promise.'
         )
       ),
       el('div', { class: 'facts' },
@@ -207,7 +238,8 @@
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(total) })),
         el('div', { class: 'fact' }, el('span', { text: 'Snapshot-wide multiple' }), el('b', { text: DATA.global_multiple.toFixed(4) + 'x' }))
-      )
+      ),
+      el('div', { class: 'formula-strip' }, 'implied = TVL x category multiple x growth x maturity — each row priced by its own category\u2019s trading peers')
     );
   }
 
@@ -219,10 +251,9 @@
         return el('button', { type: 'button', class: 'spot-card', onclick: function () { openDetail(r.slug); } },
           el('span', { class: 'rank', text: 'RANK ' + r.rank }),
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains[0] : 'an unnamed chain') }),
+          el('span', { class: 'mult', text: multipleText(r) }),
           el('span', { class: 'implied num', text: fmtUsd(r.implied_value_usd) }),
-          el('span', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('span', { class: 'sub', text: 'Pool at 7.5%: ' + fmtUsd(r.pool_usd) })
+          el('span', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' }))
         );
       })
     );
@@ -258,7 +289,7 @@
       el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chn),
       el('div', { class: 'field' }, el('label', { for: 'sort', text: 'Sort by' }), sort),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'View' }), el('div', { class: 'tabs' }, tabBtn('pre-token', 'Pre-token'), tabBtn('live', 'Live token'), tabBtn('model', 'How it works'))),
-      el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : state.tab === 'live' ? DATA.live.length + ' live-token protocols' : 'One formula, every row' })
+      el('span', { class: 'count', text: state.tab === 'pre-token' ? 'Select a row for its model and farm plan · ' + rows().length + ' rows shown' : state.tab === 'live' ? DATA.live.length + ' live-token protocols' : 'One formula, every row' })
     );
   }
 
@@ -280,7 +311,7 @@
         el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; writeHash(); render(); } })
       ));
     }
-    var max = Math.max.apply(null, list.map(function (r) { return r.implied_value_usd; })) || 1;
+    var max = (DATA.rows[0] && DATA.rows[0].implied_value_usd) || 1;
     var tbody = el('tbody');
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
@@ -312,7 +343,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.' }),
+          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Farm cost is the capital the plan needs plus the gas it spends over the hold; the pool is an assumed 7.5% community share, not a promise.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
@@ -320,7 +351,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
-            sortHeader('pool', 'Pool 7.5%'),
+            sortHeader('pool', 'Assumed pool'),
             el('th', { scope: 'col', text: 'Farm cost' }),
             el('th', { scope: 'col', text: 'Board' })
           )),
@@ -362,16 +393,33 @@
         el('td', { class: 'num', text: x.multiple.toFixed(3) + 'x' })
       );
     });
+    var famRows = DATA.families.map(function (x) {
+      return el('tr', null,
+        el('td', { text: x.family }),
+        el('td', { class: 'num', text: String(x.comps) }),
+        el('td', { class: 'num', text: x.multiple.toFixed(3) + 'x' })
+      );
+    });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is the category’s own market: the median market-cap-to-TVL ratio of the protocols in that category that already trade, where five or more such comparables exist; otherwise the snapshot-wide median of ' + DATA.global_multiple.toFixed(4) + 'x.' }),
+      el('p', { text: 'The board covers 40 of 40 watchlist protocols, ranked by an implied value: TVL times a market multiple from the snapshot\u2019s own trading protocols, times seven-day growth, times maturity with no token. Every row carries a six-step farm plan that states its capital, its gas and its hold. Protocols whose token already trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is the category\u2019s own market: the median market-cap-to-TVL ratio of the protocols in that category that already trade, where five or more such comparables exist; otherwise the median of the category\u2019s family of neighbouring categories pooled the same way; otherwise the snapshot-wide median of ' + DATA.global_multiple.toFixed(4) + 'x. Categories with no family multiple fall through to the snapshot-wide one.' }),
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
+      el('h3', { text: 'Category multiples' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Multiple' }))),
           el('tbody', null, multRows)
+        )
+      ),
+      el('h3', { text: 'Family multiples' }),
+      el('p', { class: 'sub', text: 'When a category has fewer than five trading comparables of its own, its rows use its family\u2019s pooled median instead. Each family\u2019s multiple is the median of the live market-cap-to-TVL ratios of all its member categories, computed from this snapshot; a family with fewer than five pooled comparables has no multiple and its rows fall through to the snapshot-wide one.' }),
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'mult-table' },
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Family' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Multiple' }))),
+          el('tbody', null, famRows)
         )
       ),
       el('ul', { class: 'caveats' },
@@ -393,7 +441,7 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var mult = multipleFor(row.category);
+    var mult = multipleFor(row);
     var recomputed = impliedOf(row, DATA.model);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
@@ -407,7 +455,7 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: (row.category || 'Other') + ' multiple' }), el('b', { class: 'num', text: mult.multiple.toFixed(3) + 'x' + (mult.fallback ? ' (snapshot-wide)' : ' (' + mult.comps + ' comps)') })),
+        el('div', null, el('span', { text: (mult.source === 'family' ? row.family + ' multiple' : (row.category || 'Other') + ' multiple') }), el('b', { class: 'num', text: mult.multiple.toFixed(3) + 'x' + (mult.source === 'global' ? ' (snapshot-wide)' : ' (' + mult.comps + ' comps)') })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth x maturity' }), el('b', { class: 'num', text: row.growth_multiplier + ' x ' + row.maturity_multiplier })),

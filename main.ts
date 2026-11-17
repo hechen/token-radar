@@ -5,7 +5,7 @@
 // /output/board.json, and copies this repository's dashboard/ and screenshots/ to /output. Last, it
 // writes /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
 //
-// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
+// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/theme.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board. It covers
 // the whole watchlist, ranks by an implied value derived from the snapshot's own figures, states the
 // model with its per-category multiples, and gives every protocol a concrete farm plan.
