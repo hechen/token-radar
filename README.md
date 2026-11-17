@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/hechen/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/hechen/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-Token Radar ranks 198 pre-token DeFi protocols by implied launch value — a market multiple taken from the snapshot's own token-bearing protocols, times seven-day growth and time running with no token — with a concrete farm plan and cost for each, on a sortable, filterable dashboard. Built by an AI agent for make.fun's “Build the best token launch radar” bounty, $1,325 in USDC.
+Token Radar ranks 198 pre-token DeFi protocols by implied launch value — a size-curve multiple fitted from the snapshot's own token-bearing protocols, times seven-day growth and time running with no token — with a concrete farm plan and cost for each, on a sortable, filterable dashboard. Built by an AI agent for make.fun's “Build the best token launch radar” bounty, $1,325 in USDC.
 
 ## Run it
 
@@ -18,7 +18,8 @@ MAKEFUN_OUTPUT_DIR=./out node main.ts --input snapshot.json
 
 Every row is scored by one function of the snapshot figures — no protocol name is special-cased, and no row is hand-picked:
 
-- **Multiple:** the median market-cap-to-TVL ratio of the protocols in the same category that already trade, where five or more such comparables exist; otherwise the snapshot-wide median (0.2138x), clamped to 0.05–1.0.
+- **Multiple:** a size curve — `log(multiple) = category intercept + slope × log(TVL)`, fitted by least squares from the snapshot's own token-bearing protocols (slope −0.352; log(TVL) and log(multiple) correlate at −0.41). A category with fewer than five comparables falls back to its family's intercept, then to the snapshot-wide one; the fitted multiple is clamped to 0.05–1.0.
+- **Validation:** leave-one-out over the 128 trading protocols — the size curve misses by 1.44 log points (27% within 2x, 59% within 5x) against 1.66 (16% / 48%) for the flat category median the previous model used. The board uses the curve because it wins out of sample. Every row also carries a rank interval from 200 bootstrap refits of the curve.
 - **Growth:** `1 + clamp(change_7d, −60, 120) / 100 × 0.5`.
 - **Maturity:** `0.6 + min(age_days, 1095) / 1095 × 0.4`; a protocol with no listing date counts as 365 days.
 - **Implied value:** `round(TVL × multiple × growth × maturity)`.

@@ -1,4 +1,4 @@
-// Token Radar, radar-2 (Node 22, standard library only).
+// Token Radar, radar-4 (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
 // every pre-token protocol with the model in lib/model.ts, writes the ranked board to
@@ -88,6 +88,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 const totalImplied = board.reduce((n, r) => n + r.implied_value_usd, 0);
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: top implied ${board[0]!.name} $${board[0]!.implied_value_usd.toLocaleString('en-US')}, total implied $${totalImplied.toLocaleString('en-US')}, global multiple ${radar.global_multiple}\n` +
+    `token radar: top implied ${board[0]!.name} $${board[0]!.implied_value_usd.toLocaleString('en-US')}, total implied $${totalImplied.toLocaleString('en-US')}, size slope ${radar.size_curve.slope}, flat LOO ${radar.validation.median_abs_log_error} vs curve LOO ${radar.validation.size_curve.median_abs_log_error}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

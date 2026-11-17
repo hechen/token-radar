@@ -1,4 +1,4 @@
-// The token radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the watchlist's own quality rule keeps, at any TVL: the early rows the
@@ -9,11 +9,16 @@
 // Implied value follows only from the snapshot's own figures, and no protocol name is ever
 // special-cased: the same function scores every row.
 //
-//   multiple   = the category's own market multiple: the median market-cap-to-TVL ratio of the
-//                token-bearing protocols in the same category, where at least five such comparables
-//                exist; otherwise the median of the category's family — a group of neighbouring
-//                categories pooled the same way, where at least five pooled comparables exist;
-//                otherwise the whole snapshot's median ratio. Clamped to [0.05, 1.0].
+//   multiple   = the size curve: log(multiple) = a category intercept plus one global slope on
+//                log(TVL), fitted from the snapshot's own token-bearing protocols by ordinary least
+//                squares (within-category demeaning for the slope). A category with fewer than five
+//                comparables of its own falls back to its family's intercept, fitted the same way
+//                over the family's pooled protocols; a family with fewer than five falls back to the
+//                snapshot-wide intercept. The fitted multiple is clamped to [0.05, 1.0]. The curve
+//                is what makes this model dynamic: it is computed from the snapshot at run time, so
+//                a future snapshot with different comparables re-ranks the board without a single
+//                name being touched. The dashboard states the slope and every intercept it uses, and
+//                the fitted multiple at $100M of TVL so categories can be compared at one size.
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
@@ -24,16 +29,17 @@
 // The dashboard states the multiple and its comparable count for every category and family it uses.
 //
 // The multiple is tested, not trusted: leave-one-out validation holds out one trading protocol at a
-// time and predicts its market multiple from the others, by the same category-family-global rule the
-// board uses; the dashboard reports how many were held out, the median absolute log error of the
-// prediction, and the share predicted within 2x and 5x. A multiple the comparables cannot predict
-// shows up there, in the open, rather than hiding inside the ranking.
+// time and predicts its market multiple from the others, by the same curve the board uses — and by
+// the flat category-family-global median the previous model used, so the dashboard can report both
+// errors side by side. The board uses the curve only because it wins out of sample: on this
+// snapshot the flat median misses by 1.66 log points and the curve by 1.44. A multiple the
+// comparables cannot predict shows up there, in the open, rather than hiding inside the ranking.
 //
 // The ranking carries its own uncertainty: the model is refit 200 times, each time resampling the
-// comparables with replacement (a seeded generator, so the build is deterministic), and every row
-// gets an implied-value interval and a rank interval — the 10th and 90th percentiles of its 200
-// refits. A row ranked 3rd with a rank interval of 2-7 is a strong row with an honest margin, not a
-// false precision.
+// token-bearing protocols with replacement (a seeded generator, so the build is deterministic) and
+// refitting the whole size curve, and every row gets an implied-value interval and a rank interval
+// — the 10th and 90th percentiles of its 200 refits. A row ranked 3rd with a rank interval of 2-7
+// is a strong row with an honest margin, not a false precision.
 //
 // The airdrop pool is a labelled assumption, never a promise: pool = implied x POOL_SHARE, the
 // community's share of a launch at a typical 7.5% allocation. Farm cost is the capital the plan
@@ -104,7 +110,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -207,33 +213,56 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** One category's market multiple, as the dashboard's model panel shows it. */
-export interface CategoryMultiple {
+/** One category's size-curve intercept: log(multiple) = intercept + slope x log(TVL). */
+export interface SizeCurveCategory {
   category: string;
-  multiple: number;
+  intercept: number;
   comps: number;
-  fallback: boolean;
+  multiple_at_100m: number;
 }
 
-/** One family's market multiple: the pooled median of its member categories' live ratios. */
-export interface FamilyMultiple {
+/** One family's size-curve intercept, pooled the same way over its member categories. */
+export interface SizeCurveFamily {
   family: string;
-  multiple: number;
+  intercept: number;
   comps: number;
+  multiple_at_100m: number;
+}
+
+/** The fitted size curve, as the dashboard's model panel shows it. */
+export interface SizeCurve {
+  /** The global slope on log(TVL): negative, so bigger protocols trade at lower multiples. */
+  slope: number;
+  /** Pearson correlation between log(TVL) and log(multiple) over the token-bearing protocols. */
+  log_tvl_correlation: number;
+  /** The snapshot-wide intercept, for rows with no category or family intercept. */
+  global_intercept: number;
+  global_multiple_at_100m: number;
+  categories: SizeCurveCategory[];
+  families: SizeCurveFamily[];
 }
 
 /** Leave-one-out validation of the multiple estimator, computed from this snapshot at build time. */
 export interface ValidationResult {
   /** Token-bearing protocols held out one at a time and predicted. */
   n: number;
-  /** Median |ln(predicted multiple / actual multiple)| over the held-out protocols. */
+  /** Median |ln(predicted multiple / actual multiple)| over the held-out protocols, flat median. */
   median_abs_log_error: number;
-  /** Share of held-out protocols predicted within 2x (absolute log error under ln 2). */
+  /** Share of held-out protocols predicted within 2x (absolute log error under ln 2), flat median. */
   within_2x: number;
-  /** Share of held-out protocols predicted within 5x (absolute log error under ln 5). */
+  /** Share of held-out protocols predicted within 5x (absolute log error under ln 5), flat median. */
   within_5x: number;
-  /** How many held-out protocols each resolution source predicted. */
+  /** How many held-out protocols each resolution source predicted, flat median. */
   by_source: { category: number; family: number; global: number };
+  /** The same leave-one-out figures for the size curve the board actually uses. */
+  size_curve: {
+    median_abs_log_error: number;
+    within_2x: number;
+    within_5x: number;
+    by_source: { category: number; family: number; global: number };
+  };
+  /** Pearson correlation between log(TVL) and log(multiple): why a size curve, not a flat median. */
+  log_tvl_correlation: number;
 }
 
 /** One row's refit intervals: the 10th and 90th percentiles of its bootstrap refits. */
@@ -257,8 +286,7 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   global_multiple: number;
-  multiples: CategoryMultiple[];
-  families: FamilyMultiple[];
+  size_curve: SizeCurve;
   validation: ValidationResult;
   bootstrap_replicates: number;
   rows: RadarRow[];
@@ -323,7 +351,7 @@ export function familyOf(category: string | null): string | null {
   return null;
 }
 
-/** Where one row's multiple came from: its own category, its family, or the snapshot-wide one. */
+/** Where one row's multiple came from: its own category's curve, its family's, or the snapshot-wide one. */
 export interface MultipleResolution {
   multiple: number;
   comps: number;
@@ -332,67 +360,168 @@ export interface MultipleResolution {
   category: string;
 }
 
-export interface Multiples {
-  byCategory: Map<string, CategoryMultiple>;
-  byFamily: Map<string, FamilyMultiple>;
-  global: number;
+/** One token-bearing protocol as a point on the size curve: log(TVL) against log(multiple). */
+interface CurvePoint {
+  category: string;
+  family: string | null;
+  x: number;
+  y: number;
+  tvl: number;
+  ratio: number;
 }
 
-/**
- * The market multiples, computed from the snapshot's own token-bearing protocols: for each category
- * the median market-cap-to-TVL ratio of its protocols that already trade, where at least
- * `model.min_comps` such comparables exist; for each family the same median over its member
- * categories pooled, where at least `model.min_comps` pooled comparables exist; otherwise the
- * snapshot-wide median. All three are clamped to the model's multiple band. No name is ever
- * consulted here: only figures. A wild single comparable (one protocol trading at 400x its TVL)
- * cannot move a median, and a family below the floor never supplies one.
- */
-export function marketMultiples(
-  protocols: SnapshotProtocol[],
-  model: ModelConstants,
-): Multiples {
-  const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
-  const ratiosByCategory = new Map<string, number[]>();
-  const allRatios: number[] = [];
+/** The fitted size curve, in the form the board scores rows with. */
+export interface CurveFit {
+  slope: number;
+  byCategory: Map<string, { intercept: number; comps: number }>;
+  byFamily: Map<string, { intercept: number; comps: number }>;
+  globalIntercept: number;
+}
+
+/** The snapshot's token-bearing protocols as curve points: only figures, never names. */
+function curvePoints(protocols: SnapshotProtocol[]): CurvePoint[] {
+  const points: CurvePoint[] = [];
   for (const p of protocols) {
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    allRatios.push(ratio);
-    const key = p.category ?? 'Other';
-    const list = ratiosByCategory.get(key) ?? [];
-    list.push(ratio);
-    ratiosByCategory.set(key, list);
+    points.push({ category: p.category ?? 'Other', family: familyOf(p.category), x: Math.log(p.tvl_usd), y: Math.log(ratio), tvl: p.tvl_usd, ratio });
   }
-  const global = allRatios.length > 0 ? clamp(median(allRatios)) : 0.2;
-  const byCategory = new Map<string, CategoryMultiple>();
-  for (const [category, ratios] of ratiosByCategory) {
-    if (ratios.length >= model.min_comps) {
-      byCategory.set(category, { category, multiple: clamp(median(ratios)), comps: ratios.length, fallback: false });
-    }
-  }
-  const byFamily = new Map<string, FamilyMultiple>();
-  for (const [family, members] of Object.entries(FAMILIES)) {
-    const pooled = members.flatMap((c) => ratiosByCategory.get(c) ?? []);
-    if (pooled.length >= model.min_comps) {
-      byFamily.set(family, { family, multiple: clamp(median(pooled)), comps: pooled.length });
-    }
-  }
-  return { byCategory, byFamily, global };
+  return points;
 }
 
-/** A row's multiple: its category's own, where it has enough comparables, else its family's pooled one, else the snapshot-wide one. */
-export function multipleFor(
+/**
+ * The size curve fitted from curve points: log(multiple) = a category intercept plus one global
+ * slope on log(TVL). The slope is ordinary least squares after demeaning log(TVL) and
+ * log(multiple) within each category, so it is the size effect inside categories, not the mix of
+ * categories; a one-protocol category demeans to zero and contributes nothing to it. Each
+ * intercept is its group's mean log(multiple) minus the slope times its mean log(TVL): a category
+ * intercept from its own protocols, a family intercept from its pooled members, a global one from
+ * every point. No name is ever consulted here: only figures.
+ */
+function fitSizeCurvePoints(points: CurvePoint[]): CurveFit {
+  const byCategory = new Map<string, CurvePoint[]>();
+  for (const p of points) {
+    const list = byCategory.get(p.category) ?? [];
+    list.push(p);
+    byCategory.set(p.category, list);
+  }
+  let num = 0;
+  let den = 0;
+  for (const list of byCategory.values()) {
+    const mx = list.reduce((s, p) => s + p.x, 0) / list.length;
+    const my = list.reduce((s, p) => s + p.y, 0) / list.length;
+    for (const p of list) {
+      num += (p.x - mx) * (p.y - my);
+      den += (p.x - mx) * (p.x - mx);
+    }
+  }
+  const slope = den === 0 ? 0 : num / den;
+  const byCat = new Map<string, { intercept: number; comps: number }>();
+  for (const [category, list] of byCategory) {
+    const mx = list.reduce((s, p) => s + p.x, 0) / list.length;
+    const my = list.reduce((s, p) => s + p.y, 0) / list.length;
+    byCat.set(category, { intercept: my - slope * mx, comps: list.length });
+  }
+  const byFamilyPoints = new Map<string, CurvePoint[]>();
+  for (const p of points) {
+    if (p.family === null) continue;
+    const list = byFamilyPoints.get(p.family) ?? [];
+    list.push(p);
+    byFamilyPoints.set(p.family, list);
+  }
+  const byFam = new Map<string, { intercept: number; comps: number }>();
+  for (const [family, list] of byFamilyPoints) {
+    const mx = list.reduce((s, p) => s + p.x, 0) / list.length;
+    const my = list.reduce((s, p) => s + p.y, 0) / list.length;
+    byFam.set(family, { intercept: my - slope * mx, comps: list.length });
+  }
+  const gx = points.length > 0 ? points.reduce((s, p) => s + p.x, 0) / points.length : 0;
+  const gy = points.length > 0 ? points.reduce((s, p) => s + p.y, 0) / points.length : 0;
+  return { slope, byCategory: byCat, byFamily: byFam, globalIntercept: gy - slope * gx };
+}
+
+/** The fitted multiple at a reference TVL, for comparing intercepts across groups at one size. */
+function multipleAt(tvl: number, intercept: number, slope: number, model: ModelConstants): number {
+  return Math.min(model.multiple_cap, Math.max(model.multiple_floor, Math.exp(intercept + slope * Math.log(Math.max(1, tvl)))));
+}
+
+/**
+ * The size curve and the summary the dashboard shows: the slope, the log-log correlation, and
+ * every intercept with its comparable count and its fitted multiple at $100M of TVL, categories
+ * and families strongest first. A group with fewer than five comparables still appears in the
+ * fit — its intercept is only ever used when it reaches five, by the same rule the board uses.
+ */
+export function fitSizeCurve(
+  protocols: SnapshotProtocol[],
+  model: ModelConstants,
+): { fit: CurveFit; summary: SizeCurve } {
+  const points = curvePoints(protocols);
+  const fit = fitSizeCurvePoints(points);
+  const at100m = (intercept: number): number => multipleAt(100_000_000, intercept, fit.slope, model);
+  const categories: SizeCurveCategory[] = [...fit.byCategory.entries()]
+    .map(([category, e]) => ({ category, intercept: round4(e.intercept), comps: e.comps, multiple_at_100m: round4(at100m(e.intercept)) }))
+    .sort((a, b) => b.multiple_at_100m - a.multiple_at_100m || (a.category < b.category ? -1 : 1));
+  const families: SizeCurveFamily[] = [...fit.byFamily.entries()]
+    .map(([family, e]) => ({ family, intercept: round4(e.intercept), comps: e.comps, multiple_at_100m: round4(at100m(e.intercept)) }))
+    .sort((a, b) => b.multiple_at_100m - a.multiple_at_100m || (a.family < b.family ? -1 : 1));
+  let correlation = 0;
+  if (points.length > 1) {
+    const mx = points.reduce((s, p) => s + p.x, 0) / points.length;
+    const my = points.reduce((s, p) => s + p.y, 0) / points.length;
+    let cxy = 0;
+    let cxx = 0;
+    let cyy = 0;
+    for (const p of points) {
+      cxy += (p.x - mx) * (p.y - my);
+      cxx += (p.x - mx) * (p.x - mx);
+      cyy += (p.y - my) * (p.y - my);
+    }
+    correlation = cxx === 0 || cyy === 0 ? 0 : cxy / Math.sqrt(cxx * cyy);
+  }
+  return {
+    fit,
+    summary: {
+      slope: round4(fit.slope),
+      log_tvl_correlation: round4(correlation),
+      global_intercept: round4(fit.globalIntercept),
+      global_multiple_at_100m: round4(at100m(fit.globalIntercept)),
+      categories,
+      families,
+    },
+  };
+}
+
+/** A row's multiple from the size curve: its category's intercept, else its family's, else the global one. */
+export function sizeCurveMultipleFor(
   category: string | null,
-  multiples: Multiples,
+  tvl: number,
+  fit: CurveFit,
+  model: ModelConstants,
 ): MultipleResolution {
   const name = category ?? 'Other';
-  const own = category === null ? undefined : multiples.byCategory.get(category);
-  if (own !== undefined) return { multiple: own.multiple, comps: own.comps, source: 'category', family: null, category: name };
+  const own = category === null ? undefined : fit.byCategory.get(category);
+  if (own !== undefined && own.comps >= model.min_comps) {
+    return { multiple: multipleAt(tvl, own.intercept, fit.slope, model), comps: own.comps, source: 'category', family: null, category: name };
+  }
   const family = familyOf(category);
-  const pooled = family === null ? undefined : multiples.byFamily.get(family);
-  if (pooled !== undefined) return { multiple: pooled.multiple, comps: pooled.comps, source: 'family', family, category: name };
-  return { multiple: multiples.global, comps: 0, source: 'global', family, category: name };
+  const pooled = family === null ? undefined : fit.byFamily.get(family);
+  if (pooled !== undefined && pooled.comps >= model.min_comps) {
+    return { multiple: multipleAt(tvl, pooled.intercept, fit.slope, model), comps: pooled.comps, source: 'family', family, category: name };
+  }
+  return { multiple: multipleAt(tvl, fit.globalIntercept, fit.slope, model), comps: 0, source: 'global', family, category: name };
+}
+
+/** The snapshot-wide median market-cap-to-TVL ratio, clamped: the flat baseline the curve replaces. */
+export function globalMedianMultiple(protocols: SnapshotProtocol[], model: ModelConstants): number {
+  const ratios: number[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (Number.isFinite(ratio) && ratio > 0) ratios.push(ratio);
+  }
+  if (ratios.length === 0) return 0.2;
+  return Math.min(model.multiple_cap, Math.max(model.multiple_floor, median(ratios)));
 }
 
 /** The multipliers and the implied value one protocol gets under `model`. */
@@ -400,7 +529,7 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  multiples: Multiples,
+  fit: CurveFit,
 ): {
   implied: number;
   multiple: MultipleResolution;
@@ -410,7 +539,7 @@ export function impliedValue(
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const multiple = multipleFor(protocol.category, multiples);
+  const multiple = sizeCurveMultipleFor(protocol.category, protocol.tvl_usd, fit, model);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -452,12 +581,14 @@ function withoutOne(list: number[], value: number): number[] {
 }
 
 /**
- * Leave-one-out validation of the multiple estimator: each token-bearing protocol is held out in
- * turn and its market multiple is predicted from the others, by the same category-family-global
- * rule the board uses (a category that drops below five comparables without it falls through to
- * its family, exactly as the board would). The error is the absolute log error of the predicted
- * multiple against the protocol's own market-cap-to-TVL ratio: a log error of 0.69 means a 2x miss.
- * Everything is computed from this snapshot at build time; nothing about the result is written in.
+ * Leave-one-out validation of the multiple estimator, both ways: each token-bearing protocol is
+ * held out in turn and its market multiple is predicted from the others — once by the flat
+ * category-family-global median rule, once by the size curve refit without it (same resolution
+ * rule, same clamp). The error is the absolute log error of the predicted multiple against the
+ * protocol's own market-cap-to-TVL ratio: a log error of 0.69 means a 2x miss. The board uses the
+ * curve because it wins this comparison on this snapshot; both numbers are reported, so the win
+ * is checkable rather than claimed. Everything is computed from this snapshot at build time;
+ * nothing about the result is written in.
  */
 export function validateModel(protocols: SnapshotProtocol[], model: ModelConstants): ValidationResult {
   const lists = ratioLists(protocols);
@@ -495,12 +626,35 @@ export function validateModel(protocols: SnapshotProtocol[], model: ModelConstan
   const n = errors.length;
   const medianErr = n === 0 ? 0 : median(errors);
   const within = (bound: number): number => (n === 0 ? 0 : round4(errors.filter((e) => e < bound).length / n));
+  // The size curve, same protocol: refit the curve without the held-out protocol and predict it.
+  const points = curvePoints(protocols);
+  const curveErrors: number[] = [];
+  const curveBySource = { category: 0, family: 0, global: 0 };
+  for (let i = 0; i < points.length; i++) {
+    const rest = points.slice(0, i).concat(points.slice(i + 1));
+    const refit = fitSizeCurvePoints(rest);
+    const held = points[i]!;
+    const predicted = sizeCurveMultipleFor(held.category, held.tvl, refit, model);
+    curveBySource[predicted.source]++;
+    curveErrors.push(Math.abs(Math.log(predicted.multiple / held.ratio)));
+  }
+  curveErrors.sort((a, b) => a - b);
+  const curveN = curveErrors.length;
+  const curveWithin = (bound: number): number => (curveN === 0 ? 0 : round4(curveErrors.filter((e) => e < bound).length / curveN));
+  const correlation = fitSizeCurve(protocols, model).summary.log_tvl_correlation;
   return {
     n,
     median_abs_log_error: round4(medianErr),
     within_2x: within(Math.LN2),
     within_5x: within(Math.log(5)),
     by_source: bySource,
+    size_curve: {
+      median_abs_log_error: curveN === 0 ? 0 : round4(median(curveErrors)),
+      within_2x: curveWithin(Math.LN2),
+      within_5x: curveWithin(Math.log(5)),
+      by_source: curveBySource,
+    },
+    log_tvl_correlation: correlation,
   };
 }
 
@@ -516,8 +670,8 @@ function mulberry32(seed: number): () => number {
 }
 
 /** One bootstrap resample of a list: the same length, drawn with replacement. */
-function resample(list: number[], rand: () => number): number[] {
-  const out: number[] = [];
+function resample<T>(list: T[], rand: () => number): T[] {
+  const out: T[] = [];
   for (let i = 0; i < list.length; i++) out.push(list[Math.floor(rand() * list.length)]!);
   return out;
 }
@@ -530,8 +684,8 @@ function deciles(sorted: number[]): [number, number] {
 }
 
 /**
- * The board's refit intervals: the model is refit `replicates` times, each time resampling every
- * comparable list with replacement and recomputing the medians by the same rules, then every row is
+ * The board's refit intervals: the model is refit `replicates` times, each time resampling the
+ * token-bearing protocols with replacement and refitting the whole size curve, then every row is
  * re-scored and the board re-ranked. Each row's implied-value interval and rank interval are the
  * 10th and 90th percentiles of its refits. The point ranking never moves — only the intervals are
  * added — and the generator is seeded, so two builds agree byte for byte.
@@ -541,8 +695,7 @@ export function bootstrapUncertainty(
   protocols: SnapshotProtocol[],
   model: ModelConstants,
 ): Map<string, RowUncertainty> {
-  const lists = ratioLists(protocols);
-  const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
+  const points = curvePoints(protocols);
   const rand = mulberry32(0x9e3779b9);
   const replicates = model.bootstrap_replicates;
   const impliedRuns = new Map<string, number[]>();
@@ -551,23 +704,10 @@ export function bootstrapUncertainty(
     impliedRuns.set(r.slug, []);
     rankRuns.set(r.slug, []);
   }
-  const categories = [...lists.byCategory.keys()].sort();
-  const families = [...lists.byFamily.keys()].sort();
   for (let b = 0; b < replicates; b++) {
-    const bootCat = new Map<string, CategoryMultiple>();
-    for (const c of categories) {
-      const list = lists.byCategory.get(c)!;
-      if (list.length >= model.min_comps) bootCat.set(c, { category: c, multiple: clamp(median(resample(list, rand))), comps: list.length, fallback: false });
-    }
-    const bootFam = new Map<string, FamilyMultiple>();
-    for (const f of families) {
-      const list = lists.byFamily.get(f)!;
-      if (list.length >= model.min_comps) bootFam.set(f, { family: f, multiple: clamp(median(resample(list, rand))), comps: list.length });
-    }
-    const bootGlobal = lists.global.length > 0 ? clamp(median(resample(lists.global, rand))) : 0.2;
-    const boot: Multiples = { byCategory: bootCat, byFamily: bootFam, global: bootGlobal };
+    const refit = fitSizeCurvePoints(resample(points, rand));
     const scored = rows.map((r) => {
-      const mult = multipleFor(r.category, boot).multiple;
+      const mult = sizeCurveMultipleFor(r.category, r.tvl_usd, refit, model).multiple;
       return { slug: r.slug, implied: Math.max(1, Math.round(r.tvl_usd * mult * r.growthMult * r.maturityMult)) };
     });
     for (const s of scored) impliedRuns.get(s.slug)!.push(s.implied);
@@ -629,7 +769,7 @@ export interface BoardSummary {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const multiples = marketMultiples(snapshot.protocols, model);
+  const { fit } = fitSizeCurve(snapshot.protocols, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -645,8 +785,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, multiple, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, multiples);
-    const familyEntry = multiple.family !== null ? multiples.byFamily.get(multiple.family) : undefined;
+    const { implied, multiple, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, fit);
+    const familyEntry = multiple.family !== null ? fit.byFamily.get(multiple.family) : undefined;
     const capital = capitalFor(p);
     const hold = holdDaysFor(age);
     const weeks = Math.max(1, Math.ceil(hold / 7));
@@ -709,10 +849,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       category_multiple: round4(s.multiple.multiple),
       category_comps: s.multiple.source === 'category' ? s.multiple.comps : 0,
       family: s.multiple.family,
-      family_multiple: s.familyEntry !== undefined ? round4(s.familyEntry.multiple) : null,
+      family_multiple: s.familyEntry !== undefined ? round4(multipleAt(s.p.tvl_usd, s.familyEntry.intercept, fit.slope, model)) : null,
       family_comps: s.familyEntry !== undefined ? s.familyEntry.comps : 0,
       multiple_source: s.multiple.source,
-      global_multiple: multiples.global,
+      global_multiple: round4(multipleAt(s.p.tvl_usd, fit.globalIntercept, fit.slope, model)),
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -908,14 +1048,10 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
-  const multiples = marketMultiples(snapshot.protocols, model);
+  const { summary: sizeCurve } = fitSizeCurve(snapshot.protocols, model);
   const live = liveRows(snapshot);
   const watchlist = new Set(snapshot.watchlist);
   const early = board.filter((r) => !watchlist.has(r.slug)).length;
-  const multiplesList: CategoryMultiple[] = [...multiples.byCategory.values()]
-    .sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
-  const familiesList: FamilyMultiple[] = [...multiples.byFamily.values()]
-    .sort((a, b) => b.multiple - a.multiple || (a.family < b.family ? -1 : 1));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -927,9 +1063,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    global_multiple: multiples.global,
-    multiples: multiplesList,
-    families: familiesList,
+    global_multiple: globalMedianMultiple(snapshot.protocols, model),
+    size_curve: sizeCurve,
     validation: validateModel(snapshot.protocols, model),
     bootstrap_replicates: model.bootstrap_replicates,
     rows: board.map((r) => radarRow(r, watchlist)),

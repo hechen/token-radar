@@ -1,19 +1,22 @@
-// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-4. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a filterable table, a per-protocol detail view with the model's own
 // inputs and the protocol's farm plan, and the model itself. No network: every byte it shows is in
 // data.js. The model below is the same arithmetic main.ts writes to board.json, so the page's code
 // and the board's data are visibly the same function of the snapshot's figures.
 //
 // What this page is: the board covers 40 of 40 watchlist protocols, ranked by an implied value —
-// TVL times a market multiple from the snapshot's own trading protocols, times seven-day growth,
-// times maturity with no token. Every row carries a six-step farm plan that states its capital, its
+// TVL times a size-curve multiple from the snapshot's own trading protocols, times seven-day
+// growth, times maturity with no token. The multiple is a curve, not a flat median: log(multiple)
+// is a category intercept plus one global slope on log(TVL), so a bigger protocol in a category is
+// priced at a lower multiple than a smaller one — the snapshot's trading protocols show the two
+// logs correlating at -0.41. Every row carries a six-step farm plan that states its capital, its
 // gas and its hold, and a net: the assumed airdrop pool minus the farm cost, with a farm, thin or
 // skip verdict on one farmer's expected take. The multiple is tested, not trusted: leave-one-out
-// validation holds out one trading protocol at a time and predicts its multiple from the others, and
-// the model panel reports the error plainly. Every row also carries a rank interval from 200 refits
-// of the model, so the board says how rough its own ordering is. Protocols whose token already
-// trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables
-// the model prices the board with.
+// validation holds out one trading protocol at a time and reports the size curve's error against
+// the flat median's, plainly. Every row also carries a rank interval from 200 refits of the model,
+// so the board says how rough its own ordering is. Protocols whose token already trades are set
+// aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model
+// prices the board with.
 (function () {
   'use strict';
 
@@ -24,9 +27,9 @@
   var WATCH = {};
   (DATA.watchlist || []).forEach(function (s) { WATCH[s] = true; });
   var MULT = {};
-  DATA.multiples.forEach(function (m) { MULT[m.category] = m; });
+  (DATA.size_curve.categories || []).forEach(function (m) { MULT[m.category] = m; });
   var FAM = {};
-  (DATA.families || []).forEach(function (f) { FAM[f.family] = f; });
+  (DATA.size_curve.families || []).forEach(function (f) { FAM[f.family] = f; });
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -45,28 +48,33 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
-  // The model in two functions, the same as lib/model.ts: a category's market multiple is the median
-  // market-cap-to-TVL ratio of the snapshot's token-bearing protocols in that category (five or more
-  // comparables), else the median of the category's family pooled the same way, else the snapshot-wide
-  // median; implied value is TVL times that multiple, times a growth multiplier from the seven-day
-  // change, times a maturity multiplier from the age with no token. No protocol name is special-cased
-  // anywhere. The net is the assumed airdrop pool (implied value times the assumed 7.5% community
-  // share) minus the farm cost (capital plus gas over the hold); the verdict is per farmer, on one
-  // farmer's expected take, which assumes the pool is split among 1,000 farmers. Rank intervals come
-  // from 200 refits of the same model with the comparables resampled, and are carried in the data
-  // beside each row; the page never refits the model itself.
+  // The model in two functions, the same as lib/model.ts: a row's multiple is the size curve —
+  // log(multiple) is its category's intercept plus one global slope on log(TVL), fitted from the
+  // snapshot's token-bearing protocols; a category with fewer than five comparables falls back to
+  // its family's intercept, then to the snapshot-wide one — and the fitted multiple is clamped to
+  // the model's band. Implied value is TVL times that multiple, times a growth multiplier from
+  // the seven-day change, times a maturity multiplier from the age with no token. No protocol name
+  // is special-cased anywhere. The net is the assumed airdrop pool (implied value times the
+  // assumed 7.5% community share) minus the farm cost (capital plus gas over the hold); the
+  // verdict is per farmer, on one farmer's expected take, which assumes the pool is split among
+  // 1,000 farmers. Rank intervals come from 200 refits of the same model with the comparables
+  // resampled, and are carried in the data beside each row; the page never refits the model itself.
+  function clampMult(m) {
+    return Math.min(DATA.model.multiple_cap, Math.max(DATA.model.multiple_floor, m));
+  }
   function multipleFor(row) {
-    var category = row.category || 'Other';
-    var own = MULT[category];
-    if (own && own.comps >= DATA.model.min_comps) return { multiple: own.multiple, comps: own.comps, source: 'category', label: category };
+    var curve = DATA.size_curve;
+    var logTvl = Math.log(Math.max(1, row.tvl_usd));
+    var own = MULT[row.category || 'Other'];
+    if (own && own.comps >= DATA.model.min_comps) return { multiple: clampMult(Math.exp(own.intercept + curve.slope * logTvl)), comps: own.comps, source: 'category', label: row.category || 'Other' };
     var fam = row.family ? FAM[row.family] : null;
-    if (fam && fam.comps >= DATA.model.min_comps) return { multiple: fam.multiple, comps: fam.comps, source: 'family', label: row.family };
-    return { multiple: DATA.global_multiple, comps: 0, source: 'global', label: 'snapshot-wide' };
+    if (fam && fam.comps >= DATA.model.min_comps) return { multiple: clampMult(Math.exp(fam.intercept + curve.slope * logTvl)), comps: fam.comps, source: 'family', label: row.family };
+    return { multiple: clampMult(Math.exp(curve.global_intercept + curve.slope * logTvl)), comps: 0, source: 'global', label: 'global' };
   }
   function multipleText(row) {
     var m = multipleFor(row);
-    if (m.source === 'global') return m.multiple.toFixed(3) + 'x snapshot-wide';
-    return m.multiple.toFixed(3) + 'x ' + m.label + ', ' + m.comps + ' comps';
+    if (m.source === 'global') return m.multiple.toFixed(3) + 'x global curve';
+    return m.multiple.toFixed(3) + 'x ' + m.label + ' curve, ' + m.comps + ' comps';
   }
   function impliedOf(row, model) {
     var mult = multipleFor(row).multiple;
@@ -247,9 +255,9 @@
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(total) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Snapshot-wide multiple' }), el('b', { text: DATA.global_multiple.toFixed(4) + 'x' }))
+        el('div', { class: 'fact' }, el('span', { text: 'Size slope' }), el('b', { text: DATA.size_curve.slope.toFixed(2) + ' on log TVL' }))
       ),
-      el('div', { class: 'formula-strip' }, 'implied = TVL x category multiple x growth x maturity — each row priced by its own category\u2019s trading peers')
+      el('div', { class: 'formula-strip' }, 'implied = TVL x size-curve multiple x growth x maturity — bigger protocols trade at lower multiples of TVL, so each row is priced at its own size')
     );
   }
 
@@ -401,49 +409,55 @@
 
   function modelPanel() {
     var m = DATA.model;
-    var multRows = DATA.multiples.map(function (x) {
+    var v = DATA.validation;
+    var curve = DATA.size_curve;
+    var multRows = curve.categories.map(function (x) {
       return el('tr', null,
         el('td', { text: x.category }),
         el('td', { class: 'num', text: String(x.comps) }),
-        el('td', { class: 'num', text: x.multiple.toFixed(3) + 'x' })
+        el('td', { class: 'num', text: x.intercept.toFixed(3) }),
+        el('td', { class: 'num', text: x.multiple_at_100m.toFixed(3) + 'x' })
       );
     });
-    var famRows = DATA.families.map(function (x) {
+    var famRows = curve.families.map(function (x) {
       return el('tr', null,
         el('td', { text: x.family }),
         el('td', { class: 'num', text: String(x.comps) }),
-        el('td', { class: 'num', text: x.multiple.toFixed(3) + 'x' })
+        el('td', { class: 'num', text: x.intercept.toFixed(3) }),
+        el('td', { class: 'num', text: x.multiple_at_100m.toFixed(3) + 'x' })
       );
     });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { text: 'The board covers 40 of 40 watchlist protocols, ranked by an implied value: TVL times a market multiple from the snapshot\u2019s own trading protocols, times seven-day growth, times maturity with no token. Every row carries a six-step farm plan that states its capital, its gas and its hold, and a net: the assumed airdrop pool minus the farm cost, with a farm, thin or skip verdict on one farmer’s expected take. The multiple is tested, not trusted — leave-one-out validation holds out one trading protocol at a time and reports the error plainly — and every row carries a rank interval from 200 refits of the model. Protocols whose token already trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is the category\u2019s own market: the median market-cap-to-TVL ratio of the protocols in that category that already trade, where five or more such comparables exist; otherwise the median of the category\u2019s family of neighbouring categories pooled the same way; otherwise the snapshot-wide median of ' + DATA.global_multiple.toFixed(4) + 'x. Categories with no family multiple fall through to the snapshot-wide one.' }),
+      el('p', { text: 'The board covers 40 of 40 watchlist protocols, ranked by an implied value: TVL times a size-curve multiple from the snapshot\u2019s own trading protocols, times seven-day growth, times maturity with no token. Every row carries a six-step farm plan that states its capital, its gas and its hold, and a net: the assumed airdrop pool minus the farm cost, with a farm, thin or skip verdict on one farmer’s expected take. The multiple is tested, not trusted — leave-one-out validation holds out one trading protocol at a time and reports the size curve\u2019s error against the flat median\u2019s, plainly — and every row carries a rank interval from 200 refits of the model. Protocols whose token already trades are set aside in their own tab, where their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The multiple is a size curve: log(multiple) is a category intercept plus one global slope of ' + curve.slope.toFixed(3) + ' on log(TVL), fitted from the snapshot\u2019s ' + v.n + ' trading protocols. A category with fewer than five comparables of its own falls back to its family\u2019s intercept, then to the snapshot-wide one, and the fitted multiple is clamped to ' + m.multiple_floor + '–' + m.multiple_cap + '. At a slope of ' + curve.slope.toFixed(3) + ', doubling a protocol\u2019s TVL multiplies its multiple by about ' + Math.pow(2, curve.slope).toFixed(2) + 'x. The three largest rows sit at the ' + m.multiple_floor + ' floor: the curve extrapolates below it at their size.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'implied = round( tvl_usd x exp(intercept + ' + curve.slope.toFixed(3) + ' x ln(tvl_usd)) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
       el('h3', { text: 'Validation: what the model gets wrong' }),
-      el('p', { text: 'Leave-one-out validation: each of the ' + DATA.validation.n + ' trading protocols with a market cap was held out in turn, and the model predicted its multiple from the remaining protocols using the same category, family and snapshot-wide rule. The median prediction error is ' + DATA.validation.median_abs_log_error.toFixed(2) + ' log points — about ' + Math.round(Math.exp(DATA.validation.median_abs_log_error)) + ' times the true multiple. ' + Math.round(DATA.validation.within_2x * 100) + '% of predictions land within twice the true multiple, ' + Math.round(DATA.validation.within_5x * 100) + '% within five times. ' + DATA.validation.by_source.category + ' predictions used a category median, ' + DATA.validation.by_source.family + ' a family median, ' + DATA.validation.by_source.global + ' the snapshot-wide median.' }),
-      el('p', { class: 'sub', text: 'That is the honest limit of the multiple: it is a category-typical price, not a per-protocol prediction, and individual multiples vary that much around their category median. The board is a rough ordering, and every row carries the rank interval its refits support — read the range, not just the rank.' }),
-      el('h3', { text: 'Category multiples' }),
+      el('p', { text: 'Leave-one-out validation: each of the ' + v.n + ' trading protocols with a market cap was held out in turn, and the model predicted its multiple from the remaining protocols. The flat category median misses by ' + v.median_abs_log_error.toFixed(2) + ' log points — about ' + Math.round(Math.exp(v.median_abs_log_error)) + ' times the true multiple, with ' + Math.round(v.within_2x * 100) + '% of predictions within twice the true multiple and ' + Math.round(v.within_5x * 100) + '% within five times. The size curve misses by ' + v.size_curve.median_abs_log_error.toFixed(2) + ' log points — about ' + Math.round(Math.exp(v.size_curve.median_abs_log_error)) + ' times, with ' + Math.round(v.size_curve.within_2x * 100) + '% within twice and ' + Math.round(v.size_curve.within_5x * 100) + '% within five times. The board uses the curve because it wins out of sample on this snapshot. log(TVL) and log(multiple) correlate at ' + v.log_tvl_correlation.toFixed(2) + ' across the trading protocols: that is why the multiple is a curve, not a flat median.' }),
+      el('p', { class: 'sub', text: 'That is the honest limit of the multiple: it is a size-adjusted typical price, not a per-protocol prediction, and individual multiples vary that much around their curve. The board is a rough ordering, and every row carries the rank interval its refits support — read the range, not just the rank.' }),
+      el('h3', { text: 'Size curve by category' }),
+      el('p', { class: 'sub', text: 'Each category\u2019s intercept in log(multiple) = intercept + slope x log(TVL), with its comparable count and the fitted multiple at $100M of TVL, so categories can be compared at one size. A category below five comparables still shows its intercept, but its rows use the family curve instead.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Multiple' }))),
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Intercept' }), el('th', { scope: 'col', text: 'Multiple at $100M' }))),
           el('tbody', null, multRows)
         )
       ),
-      el('h3', { text: 'Family multiples' }),
-      el('p', { class: 'sub', text: 'When a category has fewer than five trading comparables of its own, its rows use its family\u2019s pooled median instead. Each family\u2019s multiple is the median of the live market-cap-to-TVL ratios of all its member categories, computed from this snapshot; a family with fewer than five pooled comparables has no multiple and its rows fall through to the snapshot-wide one.' }),
+      el('h3', { text: 'Family curves' }),
+      el('p', { class: 'sub', text: 'When a category has fewer than five trading comparables of its own, its rows use its family\u2019s pooled intercept instead. Each family\u2019s intercept is fitted the same way over all its member categories\u2019 protocols, computed from this snapshot; a family with fewer than five pooled comparables has no curve and its rows fall through to the snapshot-wide one.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Family' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Multiple' }))),
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Family' }), el('th', { scope: 'col', text: 'Comparables' }), el('th', { scope: 'col', text: 'Intercept' }), el('th', { scope: 'col', text: 'Multiple at $100M' }))),
           el('tbody', null, famRows)
         )
       ),
       el('h3', { text: 'Rank ranges: how far a rank moves' }),
-      el('p', { text: 'The comparables are resampled with replacement and the model refit ' + DATA.bootstrap_replicates + ' times; each refit re-scores and re-ranks the whole board. A row’s implied-value range and rank range are the 10th to 90th percentile over those refits. The top row sits at rank ' + (DATA.rows[0] ? DATA.rows[0].rank_lo + '–' + DATA.rows[0].rank_hi : '—') + '; a mid-board row can move a hundred places. The point rank is the single best estimate; the range is how far it moves when the comparables shift.' }),
+      el('p', { text: 'The trading protocols are resampled with replacement and the whole size curve refit ' + DATA.bootstrap_replicates + ' times; each refit re-scores and re-ranks the whole board. A row’s implied-value range and rank range are the 10th to 90th percentile over those refits. The top row sits at rank ' + (DATA.rows[0] ? DATA.rows[0].rank_lo + '–' + DATA.rows[0].rank_hi : '—') + '; a mid-board row can move a hundred places. The point rank is the single best estimate; the range is how far it moves when the comparables shift.' }),
       el('ul', { class: 'caveats' },
         el('li', { text: 'Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+        el('li', { text: 'The multiple falls with size: log(multiple) against log(TVL) correlates at ' + v.log_tvl_correlation.toFixed(2) + ', so a $1B protocol in a category is priced at a lower multiple than a $10M one in the same category, and the largest rows can reach the ' + m.multiple_floor + ' floor.' }),
         el('li', { text: 'The pool is a labelled assumption: 7.5% of the implied value, the community’s share of a launch at a typical allocation. It is not a promise of any payout.' }),
         el('li', { text: 'Net is the assumed pool minus the farm cost, and the verdict is per farmer: one farmer’s expected take assumes the pool is split among 1,000 farmers — farm if the take clears the cost by $100 or more, thin if it clears it by less, skip if it does not clear it at all. The pool total is large on every row; the verdict is what one farmer would actually keep.' }),
         el('li', { text: '“No token” means the snapshot records none. A protocol on this board may still have a token its DefiLlama record does not carry.' }),
@@ -476,7 +490,7 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: (mult.source === 'family' ? row.family + ' multiple' : (row.category || 'Other') + ' multiple') }), el('b', { class: 'num', text: mult.multiple.toFixed(3) + 'x' + (mult.source === 'global' ? ' (snapshot-wide)' : ' (' + mult.comps + ' comps)') })),
+        el('div', null, el('span', { text: (mult.source === 'family' ? row.family + ' size curve' : (row.category || 'Other') + ' size curve') }), el('b', { class: 'num', text: mult.multiple.toFixed(3) + 'x' + (mult.source === 'global' ? ' (global curve)' : ' (' + mult.comps + ' comps)') })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth x maturity' }), el('b', { class: 'num', text: row.growth_multiplier + ' x ' + row.maturity_multiplier })),
